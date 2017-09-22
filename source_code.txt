@@ -1,0 +1,3940 @@
+  //Our project requires us to tune the parameters to get the best parameters possible so as to get as high accuracy as possible.
+  //average_precision_calculator.py
+# Copyright 2016 Google Inc. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS-IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Calculate or keep track of the interpolated average precision.
+
+It provides an interface for calculating interpolated average precision for an
+entire list or the top-n ranked items. For the definition of the
+(non-)interpolated average precision:
+http://trec.nist.gov/pubs/trec15/appendices/CE.MEASURES06.pdf
+
+Example usages:
+1) Use it as a static function call to directly calculate average precision for
+a short ranked list in the memory.
+
+```
+import random
+
+p = np.array([random.random() for _ in xrange(10)])
+a = np.array([random.choice([0, 1]) for _ in xrange(10)])
+
+ap = average_precision_calculator.AveragePrecisionCalculator.ap(p, a)
+```
+
+2) Use it as an object for long ranked list that cannot be stored in memory or
+the case where partial predictions can be observed at a time (Tensorflow
+predictions). In this case, we first call the function accumulate many times
+to process parts of the ranked list. After processing all the parts, we call
+peek_interpolated_ap_at_n.
+```
+p1 = np.array([random.random() for _ in xrange(5)])
+a1 = np.array([random.choice([0, 1]) for _ in xrange(5)])
+p2 = np.array([random.random() for _ in xrange(5)])
+a2 = np.array([random.choice([0, 1]) for _ in xrange(5)])
+
+# interpolated average precision at 10 using 1000 break points
+calculator = average_precision_calculator.AveragePrecisionCalculator(10)
+calculator.accumulate(p1, a1)
+calculator.accumulate(p2, a2)
+ap3 = calculator.peek_ap_at_n()
+```
+"""
+
+import heapq
+import random
+import numbers
+
+import numpy
+
+
+class AveragePrecisionCalculator(object):
+  """Calculate the average precision and average precision at n."""
+
+  def __init__(self, top_n=None):
+    """Construct an AveragePrecisionCalculator to calculate average precision.
+
+    This class is used to calculate the average precision for a single label.
+
+    Args:
+      top_n: A positive Integer specifying the average precision at n, or
+        None to use all provided data points.
+
+    Raises:
+      ValueError: An error occurred when the top_n is not a positive integer.
+    """
+    if not ((isinstance(top_n, int) and top_n >= 0) or top_n is None):
+      raise ValueError("top_n must be a positive integer or None.")
+
+    self._top_n = top_n  # average precision at n
+    self._total_positives = 0  # total number of positives have seen
+    self._heap = []  # max heap of (prediction, actual)
+
+  @property
+  def heap_size(self):
+    """Gets the heap size maintained in the class."""
+    return len(self._heap)
+
+  @property
+  def num_accumulated_positives(self):
+    """Gets the number of positive samples that have been accumulated."""
+    return self._total_positives
+
+  def accumulate(self, predictions, actuals, num_positives=None):
+    """Accumulate the predictions and their ground truth labels.
+
+    After the function call, we may call peek_ap_at_n to actually calculate
+    the average precision.
+    Note predictions and actuals must have the same shape.
+
+    Args:
+      predictions: a list storing the prediction scores.
+      actuals: a list storing the ground truth labels. Any value
+      larger than 0 will be treated as positives, otherwise as negatives.
+      num_positives = If the 'predictions' and 'actuals' inputs aren't complete,
+      then it's possible some true positives were missed in them. In that case,
+      you can provide 'num_positives' in order to accurately track recall.
+
+    Raises:
+      ValueError: An error occurred when the format of the input is not the
+      numpy 1-D array or the shape of predictions and actuals does not match.
+    """
+    if len(predictions) != len(actuals):
+      raise ValueError("the shape of predictions and actuals does not match.")
+
+    if not num_positives is None:
+      if not isinstance(num_positives, numbers.Number) or num_positives < 0:
+        raise ValueError("'num_positives' was provided but it wan't a nonzero number.")
+
+    if not num_positives is None:
+      self._total_positives += num_positives
+    else:
+      self._total_positives += numpy.size(numpy.where(actuals > 0))
+    topk = self._top_n
+    heap = self._heap
+
+    for i in range(numpy.size(predictions)):
+      if topk is None or len(heap) < topk:
+        heapq.heappush(heap, (predictions[i], actuals[i]))
+      else:
+        if predictions[i] > heap[0][0]:  # heap[0] is the smallest
+          heapq.heappop(heap)
+          heapq.heappush(heap, (predictions[i], actuals[i]))
+
+  def clear(self):
+    """Clear the accumulated predictions."""
+    self._heap = []
+    self._total_positives = 0
+
+  def peek_ap_at_n(self):
+    """Peek the non-interpolated average precision at n.
+
+    Returns:
+      The non-interpolated average precision at n (default 0).
+      If n is larger than the length of the ranked list,
+      the average precision will be returned.
+    """
+    if self.heap_size <= 0:
+      return 0
+    predlists = numpy.array(list(zip(*self._heap)))
+
+    ap = self.ap_at_n(predlists[0],
+                      predlists[1],
+                      n=self._top_n,
+                      total_num_positives=self._total_positives)
+    return ap
+
+  @staticmethod
+  def ap(predictions, actuals):
+    """Calculate the non-interpolated average precision.
+
+    Args:
+      predictions: a numpy 1-D array storing the sparse prediction scores.
+      actuals: a numpy 1-D array storing the ground truth labels. Any value
+      larger than 0 will be treated as positives, otherwise as negatives.
+
+    Returns:
+      The non-interpolated average precision at n.
+      If n is larger than the length of the ranked list,
+      the average precision will be returned.
+
+    Raises:
+      ValueError: An error occurred when the format of the input is not the
+      numpy 1-D array or the shape of predictions and actuals does not match.
+    """
+    return AveragePrecisionCalculator.ap_at_n(predictions,
+                                              actuals,
+                                              n=None)
+
+  @staticmethod
+  def ap_at_n(predictions, actuals, n=20, total_num_positives=None):
+    """Calculate the non-interpolated average precision.
+
+    Args:
+      predictions: a numpy 1-D array storing the sparse prediction scores.
+      actuals: a numpy 1-D array storing the ground truth labels. Any value
+      larger than 0 will be treated as positives, otherwise as negatives.
+      n: the top n items to be considered in ap@n.
+      total_num_positives : (optionally) you can specify the number of total
+        positive
+      in the list. If specified, it will be used in calculation.
+
+    Returns:
+      The non-interpolated average precision at n.
+      If n is larger than the length of the ranked list,
+      the average precision will be returned.
+
+    Raises:
+      ValueError: An error occurred when
+      1) the format of the input is not the numpy 1-D array;
+      2) the shape of predictions and actuals does not match;
+      3) the input n is not a positive integer.
+    """
+    if len(predictions) != len(actuals):
+      raise ValueError("the shape of predictions and actuals does not match.")
+
+    if n is not None:
+      if not isinstance(n, int) or n <= 0:
+        raise ValueError("n must be 'None' or a positive integer."
+                         " It was '%s'." % n)
+
+    ap = 0.0
+
+    predictions = numpy.array(predictions)
+    actuals = numpy.array(actuals)
+
+    # add a shuffler to avoid overestimating the ap
+    predictions, actuals = AveragePrecisionCalculator._shuffle(predictions,
+                                                               actuals)
+    sortidx = sorted(
+        range(len(predictions)),
+        key=lambda k: predictions[k],
+        reverse=True)
+
+    if total_num_positives is None:
+      numpos = numpy.size(numpy.where(actuals > 0))
+    else:
+      numpos = total_num_positives
+
+    if numpos == 0:
+      return 0
+
+    if n is not None:
+      numpos = min(numpos, n)
+    delta_recall = 1.0 / numpos
+    poscount = 0.0
+
+    # calculate the ap
+    r = len(sortidx)
+    if n is not None:
+      r = min(r, n)
+    for i in range(r):
+      if actuals[sortidx[i]] > 0:
+        poscount += 1
+        ap += poscount / (i + 1) * delta_recall
+    return ap
+
+  @staticmethod
+  def _shuffle(predictions, actuals):
+    random.seed(0)
+    suffidx = random.sample(range(len(predictions)), len(predictions))
+    predictions = predictions[suffidx]
+    actuals = actuals[suffidx]
+    return predictions, actuals
+
+  @staticmethod
+  def _zero_one_normalize(predictions, epsilon=1e-7):
+    """Normalize the predictions to the range between 0.0 and 1.0.
+
+    For some predictions like SVM predictions, we need to normalize them before
+    calculate the interpolated average precision. The normalization will not
+    change the rank in the original list and thus won't change the average
+    precision.
+
+    Args:
+      predictions: a numpy 1-D array storing the sparse prediction scores.
+      epsilon: a small constant to avoid denominator being zero.
+
+    Returns:
+      The normalized prediction.
+    """
+    # denominator = numpy.max(predictions) - numpy.min(predictions)
+    ret = (predictions - numpy.min(predictions)) / numpy.max(denominator,
+                                                             epsilon)
+    return ret
+
+
+  //cloudml-4gpu.yaml
+trainingInput:
+  scaleTier: CUSTOM
+  masterType: complex_model_m_gpu
+  runtimeVersion: "1.0"
+
+
+
+  //cloudml-gpu-distributed.yaml
+trainingInput:
+  runtimeVersion: "1.0"
+  scaleTier: CUSTOM
+  masterType: standard_gpu
+  workerCount: 2
+  workerType: standard_gpu
+  parameterServerCount: 2
+  parameterServerType: standard
+
+
+  //cloudml-gpu.yaml
+trainingInput:
+  scaleTier: CUSTOM
+  masterType: standard_gpu
+  runtimeVersion: "1.0"
+
+
+  //CONTRIBUTING.md
+  # How to contribute
+
+We are accepting patches and contributions to this project. To set expectations,
+this project is primarily intended to be a flexible starting point for
+researchers working with the YouTube-8M dataset. As such, we would like to keep
+it simple. We are more likely to accept small bug fixes and optimizations, and
+less likely to accept patches which add significant complexity. For the latter
+type of contribution, we recommend creating a Github fork of the project
+instead.
+
+If you would like to contribute, there are a few small guidelines you need to
+follow.
+
+## Contributor License Agreement
+
+Contributions to any Google project must be accompanied by a Contributor License
+Agreement. This is necessary because you own the copyright to your changes, even
+after your contribution becomes part of this project. So this agreement simply
+gives us permission to use and redistribute your contributions as part of the
+project. Head over to <https://cla.developers.google.com/> to see your current
+agreements on file or to sign a new one.
+
+You generally only need to submit a CLA once, so if you've already submitted one
+(even if it was for a different project), you probably don't need to do it
+again.
+
+## Code reviews
+
+All submissions, including submissions by project members, require review. We
+use GitHub pull requests for this purpose. Consult [GitHub Help] for more
+information on using pull requests.
+
+[GitHub Help]: https://help.github.com/articles/about-pull-requests/
+
+
+
+  //convert_prediction_from_json_to_csv.py
+# Copyright 2016 Google Inc. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS-IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Utility to convert the output of batch prediction into a CSV submission.
+
+It converts the JSON files created by the command
+'gcloud beta ml jobs submit prediction' into a CSV file ready for submission.
+"""
+
+import json
+import tensorflow as tf
+
+from builtins import range
+from tensorflow import app
+from tensorflow import flags
+from tensorflow import gfile
+from tensorflow import logging
+
+
+FLAGS = flags.FLAGS
+
+if __name__ == '__main__':
+
+  flags.DEFINE_string(
+      "json_prediction_files_pattern", None,
+      "Pattern specifying the list of JSON files that the command "
+      "'gcloud beta ml jobs submit prediction' outputs. These files are "
+      "located in the output path of the prediction command and are prefixed "
+      "with 'prediction.results'.")
+  flags.DEFINE_string(
+      "csv_output_file", None,
+      "The file to save the predictions converted to the CSV format.")
+
+
+def get_csv_header():
+  return "VideoId,LabelConfidencePairs\n"
+
+def to_csv_row(json_data):
+
+  video_id = json_data["video_id"]
+
+  class_indexes = json_data["class_indexes"]
+  predictions = json_data["predictions"]
+
+  if isinstance(video_id, list):
+    video_id = video_id[0]
+    class_indexes = class_indexes[0]
+    predictions = predictions[0]
+
+  if len(class_indexes) != len(predictions):
+    raise ValueError(
+        "The number of indexes (%s) and predictions (%s) must be equal." 
+        % (len(class_indexes), len(predictions)))
+
+  return (video_id.decode('utf-8') + "," + " ".join("%i %f" % 
+      (class_indexes[i], predictions[i]) 
+      for i in range(len(class_indexes))) + "\n")
+
+def main(unused_argv):
+  logging.set_verbosity(tf.logging.INFO)
+
+  if not FLAGS.json_prediction_files_pattern:
+    raise ValueError(
+        "The flag --json_prediction_files_pattern must be specified.")
+
+  if not FLAGS.csv_output_file:
+    raise ValueError("The flag --csv_output_file must be specified.")
+
+  logging.info("Looking for prediction files with pattern: %s", 
+               FLAGS.json_prediction_files_pattern)
+
+  file_paths = gfile.Glob(FLAGS.json_prediction_files_pattern)  
+  logging.info("Found files: %s", file_paths)
+
+  logging.info("Writing submission file to: %s", FLAGS.csv_output_file)
+  with gfile.Open(FLAGS.csv_output_file, "w+") as output_file:
+    output_file.write(get_csv_header())
+
+    for file_path in file_paths:
+      logging.info("processing file: %s", file_path)
+
+      with gfile.Open(file_path) as input_file:
+
+        for line in input_file: 
+          json_data = json.loads(line)
+          output_file.write(to_csv_row(json_data))
+
+    output_file.flush()
+  logging.info("done")
+
+if __name__ == "__main__":
+  app.run()
+
+
+
+  //eval.py
+# Copyright 2016 Google Inc. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS-IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Binary for evaluating Tensorflow models on the YouTube-8M dataset."""
+
+import time
+
+import eval_util
+import losses
+import frame_level_models
+import video_level_models
+import readers
+import tensorflow as tf
+from tensorflow import app
+from tensorflow import flags
+from tensorflow import gfile
+from tensorflow import logging
+import utils
+
+FLAGS = flags.FLAGS
+
+if __name__ == "__main__":
+  # Dataset flags.
+  flags.DEFINE_string("train_dir", "/tmp/yt8m_model/",
+                      "The directory to load the model files from. "
+                      "The tensorboard metrics files are also saved to this "
+                      "directory.")
+  flags.DEFINE_string(
+      "eval_data_pattern", "",
+      "File glob defining the evaluation dataset in tensorflow.SequenceExample "
+      "format. The SequenceExamples are expected to have an 'rgb' byte array "
+      "sequence feature as well as a 'labels' int64 context feature.")
+  flags.DEFINE_string("feature_names", "mean_rgb", "Name of the feature "
+                      "to use for training.")
+  flags.DEFINE_string("feature_sizes", "1024", "Length of the feature vectors.")
+
+  # Model flags.
+  flags.DEFINE_bool(
+      "frame_features", False,
+      "If set, then --eval_data_pattern must be frame-level features. "
+      "Otherwise, --eval_data_pattern must be aggregated video-level "
+      "features. The model must also be set appropriately (i.e. to read 3D "
+      "batches VS 4D batches.")
+  flags.DEFINE_string(
+      "model", "LogisticModel",
+      "Which architecture to use for the model. Options include 'Logistic', "
+      "'SingleMixtureMoe', and 'TwoLayerSigmoid'. See aggregated_models.py and "
+      "frame_level_models.py for the model definitions.")
+  flags.DEFINE_integer("batch_size", 1024,
+                       "How many examples to process per batch.")
+  flags.DEFINE_string("label_loss", "CrossEntropyLoss",
+                      "Loss computed on validation data")
+
+  # Other flags.
+  flags.DEFINE_integer("num_readers", 8,
+                       "How many threads to use for reading input files.")
+  flags.DEFINE_boolean("run_once", False, "Whether to run eval only once.")
+  flags.DEFINE_integer("top_k", 20, "How many predictions to output per video.")
+
+
+def find_class_by_name(name, modules):
+  """Searches the provided modules for the named class and returns it."""
+  modules = [getattr(module, name, None) for module in modules]
+  return next(a for a in modules if a)
+
+
+def get_input_evaluation_tensors(reader,
+                                 data_pattern,
+                                 batch_size=1024,
+                                 num_readers=1):
+  """Creates the section of the graph which reads the evaluation data.
+
+  Args:
+    reader: A class which parses the training data.
+    data_pattern: A 'glob' style path to the data files.
+    batch_size: How many examples to process at a time.
+    num_readers: How many I/O threads to use.
+
+  Returns:
+    A tuple containing the features tensor, labels tensor, and optionally a
+    tensor containing the number of frames per video. The exact dimensions
+    depend on the reader being used.
+
+  Raises:
+    IOError: If no files matching the given pattern were found.
+  """
+  logging.info("Using batch size of " + str(batch_size) + " for evaluation.")
+  with tf.name_scope("eval_input"):
+    files = gfile.Glob(data_pattern)
+    if not files:
+      raise IOError("Unable to find the evaluation files.")
+    logging.info("number of evaluation files: " + str(len(files)))
+    filename_queue = tf.train.string_input_producer(
+        files, shuffle=False, num_epochs=1)
+    eval_data = [
+        reader.prepare_reader(filename_queue) for _ in range(num_readers)
+    ]
+    return tf.train.batch_join(
+        eval_data,
+        batch_size=batch_size,
+        capacity=3 * batch_size,
+        allow_smaller_final_batch=True,
+        enqueue_many=True)
+
+
+def build_graph(reader,
+                model,
+                eval_data_pattern,
+                label_loss_fn,
+                batch_size=1024,
+                num_readers=1):
+  """Creates the Tensorflow graph for evaluation.
+
+  Args:
+    reader: The data file reader. It should inherit from BaseReader.
+    model: The core model (e.g. logistic or neural net). It should inherit
+           from BaseModel.
+    eval_data_pattern: glob path to the evaluation data files.
+    label_loss_fn: What kind of loss to apply to the model. It should inherit
+                from BaseLoss.
+    batch_size: How many examples to process at a time.
+    num_readers: How many threads to use for I/O operations.
+  """
+
+  global_step = tf.Variable(0, trainable=False, name="global_step")
+  video_id_batch, model_input_raw, labels_batch, num_frames = get_input_evaluation_tensors(  # pylint: disable=g-line-too-long
+      reader,
+      eval_data_pattern,
+      batch_size=batch_size,
+      num_readers=num_readers)
+  tf.summary.histogram("model_input_raw", model_input_raw)
+
+  feature_dim = len(model_input_raw.get_shape()) - 1
+
+  # Normalize input features.
+  model_input = tf.nn.l2_normalize(model_input_raw, feature_dim)
+
+  with tf.variable_scope("tower"):
+    result = model.create_model(model_input,
+                                num_frames=num_frames,
+                                vocab_size=reader.num_classes,
+                                labels=labels_batch,
+                                is_training=False)
+    predictions = result["predictions"]
+    tf.summary.histogram("model_activations", predictions)
+    if "loss" in result.keys():
+      label_loss = result["loss"]
+    else:
+      label_loss = label_loss_fn.calculate_loss(predictions, labels_batch)
+
+  tf.add_to_collection("global_step", global_step)
+  tf.add_to_collection("loss", label_loss)
+  tf.add_to_collection("predictions", predictions)
+  tf.add_to_collection("input_batch", model_input)
+  tf.add_to_collection("video_id_batch", video_id_batch)
+  tf.add_to_collection("num_frames", num_frames)
+  tf.add_to_collection("labels", tf.cast(labels_batch, tf.float32))
+  tf.add_to_collection("summary_op", tf.summary.merge_all())
+
+
+def evaluation_loop(video_id_batch, prediction_batch, label_batch, loss,
+                    summary_op, saver, summary_writer, evl_metrics,
+                    last_global_step_val):
+  """Run the evaluation loop once.
+
+  Args:
+    video_id_batch: a tensor of video ids mini-batch.
+    prediction_batch: a tensor of predictions mini-batch.
+    label_batch: a tensor of label_batch mini-batch.
+    loss: a tensor of loss for the examples in the mini-batch.
+    summary_op: a tensor which runs the tensorboard summary operations.
+    saver: a tensorflow saver to restore the model.
+    summary_writer: a tensorflow summary_writer
+    evl_metrics: an EvaluationMetrics object.
+    last_global_step_val: the global step used in the previous evaluation.
+
+  Returns:
+    The global_step used in the latest model.
+  """
+
+  global_step_val = -1
+  with tf.Session() as sess:
+    latest_checkpoint = tf.train.latest_checkpoint(FLAGS.train_dir)
+    if latest_checkpoint:
+      logging.info("Loading checkpoint for eval: " + latest_checkpoint)
+      # Restores from checkpoint
+      saver.restore(sess, latest_checkpoint)
+      # Assuming model_checkpoint_path looks something like:
+      # /my-favorite-path/yt8m_train/model.ckpt-0, extract global_step from it.
+      global_step_val = latest_checkpoint.split("/")[-1].split("-")[-1]
+    else:
+      logging.info("No checkpoint file found.")
+      return global_step_val
+
+    if global_step_val == last_global_step_val:
+      logging.info("skip this checkpoint global_step_val=%s "
+                   "(same as the previous one).", global_step_val)
+      return global_step_val
+
+    sess.run([tf.local_variables_initializer()])
+
+    # Start the queue runners.
+    fetches = [video_id_batch, prediction_batch, label_batch, loss, summary_op]
+    coord = tf.train.Coordinator()
+    try:
+      threads = []
+      for qr in tf.get_collection(tf.GraphKeys.QUEUE_RUNNERS):
+        threads.extend(qr.create_threads(
+            sess, coord=coord, daemon=True,
+            start=True))
+      logging.info("enter eval_once loop global_step_val = %s. ",
+                   global_step_val)
+
+      evl_metrics.clear()
+
+      examples_processed = 0
+      while not coord.should_stop():
+        batch_start_time = time.time()
+        _, predictions_val, labels_val, loss_val, summary_val = sess.run(
+            fetches)
+        seconds_per_batch = time.time() - batch_start_time
+        example_per_second = labels_val.shape[0] / seconds_per_batch
+        examples_processed += labels_val.shape[0]
+
+        iteration_info_dict = evl_metrics.accumulate(predictions_val,
+                                                     labels_val, loss_val)
+        iteration_info_dict["examples_per_second"] = example_per_second
+
+        iterinfo = utils.AddGlobalStepSummary(
+            summary_writer,
+            global_step_val,
+            iteration_info_dict,
+            summary_scope="Eval")
+        logging.info("examples_processed: %d | %s", examples_processed,
+                     iterinfo)
+
+    except tf.errors.OutOfRangeError as e:
+      logging.info(
+          "Done with batched inference. Now calculating global performance "
+          "metrics.")
+      # calculate the metrics for the entire epoch
+      epoch_info_dict = evl_metrics.get()
+      epoch_info_dict["epoch_id"] = global_step_val
+
+      summary_writer.add_summary(summary_val, global_step_val)
+      epochinfo = utils.AddEpochSummary(
+          summary_writer,
+          global_step_val,
+          epoch_info_dict,
+          summary_scope="Eval")
+      logging.info(epochinfo)
+      evl_metrics.clear()
+    except Exception as e:  # pylint: disable=broad-except
+      logging.info("Unexpected exception: " + str(e))
+      coord.request_stop(e)
+
+    coord.request_stop()
+    coord.join(threads, stop_grace_period_secs=10)
+
+    return global_step_val
+
+
+def evaluate():
+  tf.set_random_seed(0)  # for reproducibility
+  with tf.Graph().as_default():
+    # convert feature_names and feature_sizes to lists of values
+    feature_names, feature_sizes = utils.GetListOfFeatureNamesAndSizes(
+        FLAGS.feature_names, FLAGS.feature_sizes)
+
+    if FLAGS.frame_features:
+      reader = readers.YT8MFrameFeatureReader(feature_names=feature_names,
+                                              feature_sizes=feature_sizes)
+    else:
+      reader = readers.YT8MAggregatedFeatureReader(feature_names=feature_names,
+                                                   feature_sizes=feature_sizes)
+
+    model = find_class_by_name(FLAGS.model,
+        [frame_level_models, video_level_models])()
+    label_loss_fn = find_class_by_name(FLAGS.label_loss, [losses])()
+
+    if FLAGS.eval_data_pattern is "":
+      raise IOError("'eval_data_pattern' was not specified. " +
+                     "Nothing to evaluate.")
+
+    build_graph(
+        reader=reader,
+        model=model,
+        eval_data_pattern=FLAGS.eval_data_pattern,
+        label_loss_fn=label_loss_fn,
+        num_readers=FLAGS.num_readers,
+        batch_size=FLAGS.batch_size)
+    logging.info("built evaluation graph")
+    video_id_batch = tf.get_collection("video_id_batch")[0]
+    prediction_batch = tf.get_collection("predictions")[0]
+    label_batch = tf.get_collection("labels")[0]
+    loss = tf.get_collection("loss")[0]
+    summary_op = tf.get_collection("summary_op")[0]
+
+    saver = tf.train.Saver(tf.global_variables())
+    summary_writer = tf.summary.FileWriter(
+        FLAGS.train_dir, graph=tf.get_default_graph())
+
+    evl_metrics = eval_util.EvaluationMetrics(reader.num_classes, FLAGS.top_k)
+
+    last_global_step_val = -1
+    while True:
+      last_global_step_val = evaluation_loop(video_id_batch, prediction_batch,
+                                             label_batch, loss, summary_op,
+                                             saver, summary_writer, evl_metrics,
+                                             last_global_step_val)
+      if FLAGS.run_once:
+        break
+
+
+def main(unused_argv):
+  logging.set_verbosity(tf.logging.INFO)
+  print("tensorflow version: %s" % tf.__version__)
+  evaluate()
+
+
+if __name__ == "__main__":
+  app.run()
+
+
+  //eval_util.py
+# Copyright 2016 Google Inc. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS-IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Provides functions to help with evaluating models."""
+import datetime
+import numpy
+
+from tensorflow.python.platform import gfile
+
+import mean_average_precision_calculator as map_calculator
+import average_precision_calculator as ap_calculator
+
+def flatten(l):
+  """ Merges a list of lists into a single list. """
+  return [item for sublist in l for item in sublist]
+
+def calculate_hit_at_one(predictions, actuals):
+  """Performs a local (numpy) calculation of the hit at one.
+
+  Args:
+    predictions: Matrix containing the outputs of the model.
+      Dimensions are 'batch' x 'num_classes'.
+    actuals: Matrix containing the ground truth labels.
+      Dimensions are 'batch' x 'num_classes'.
+
+  Returns:
+    float: The average hit at one across the entire batch.
+  """
+  top_prediction = numpy.argmax(predictions, 1)
+  hits = actuals[numpy.arange(actuals.shape[0]), top_prediction]
+  return numpy.average(hits)
+
+
+def calculate_precision_at_equal_recall_rate(predictions, actuals):
+  """Performs a local (numpy) calculation of the PERR.
+
+  Args:
+    predictions: Matrix containing the outputs of the model.
+      Dimensions are 'batch' x 'num_classes'.
+    actuals: Matrix containing the ground truth labels.
+      Dimensions are 'batch' x 'num_classes'.
+
+  Returns:
+    float: The average precision at equal recall rate across the entire batch.
+  """
+  aggregated_precision = 0.0
+  num_videos = actuals.shape[0]
+  for row in numpy.arange(num_videos):
+    num_labels = int(numpy.sum(actuals[row]))
+    top_indices = numpy.argpartition(predictions[row],
+                                     -num_labels)[-num_labels:]
+    item_precision = 0.0
+    for label_index in top_indices:
+      if predictions[row][label_index] > 0:
+        item_precision += actuals[row][label_index]
+    item_precision /= top_indices.size
+    aggregated_precision += item_precision
+  aggregated_precision /= num_videos
+  return aggregated_precision
+
+def calculate_gap(predictions, actuals, top_k=20):
+  """Performs a local (numpy) calculation of the global average precision.
+
+  Only the top_k predictions are taken for each of the videos.
+
+  Args:
+    predictions: Matrix containing the outputs of the model.
+      Dimensions are 'batch' x 'num_classes'.
+    actuals: Matrix containing the ground truth labels.
+      Dimensions are 'batch' x 'num_classes'.
+    top_k: How many predictions to use per video.
+
+  Returns:
+    float: The global average precision.
+  """
+  gap_calculator = ap_calculator.AveragePrecisionCalculator()
+  sparse_predictions, sparse_labels, num_positives = top_k_by_class(predictions, actuals, top_k)
+  gap_calculator.accumulate(flatten(sparse_predictions), flatten(sparse_labels), sum(num_positives))
+  return gap_calculator.peek_ap_at_n()
+
+
+def top_k_by_class(predictions, labels, k=20):
+  """Extracts the top k predictions for each video, sorted by class.
+
+  Args:
+    predictions: A numpy matrix containing the outputs of the model.
+      Dimensions are 'batch' x 'num_classes'.
+    k: the top k non-zero entries to preserve in each prediction.
+
+  Returns:
+    A tuple (predictions,labels, true_positives). 'predictions' and 'labels'
+    are lists of lists of floats. 'true_positives' is a list of scalars. The
+    length of the lists are equal to the number of classes. The entries in the
+    predictions variable are probability predictions, and
+    the corresponding entries in the labels variable are the ground truth for
+    those predictions. The entries in 'true_positives' are the number of true
+    positives for each class in the ground truth.
+
+  Raises:
+    ValueError: An error occurred when the k is not a positive integer.
+  """
+  if k <= 0:
+    raise ValueError("k must be a positive integer.")
+  k = min(k, predictions.shape[1])
+  num_classes = predictions.shape[1]
+  prediction_triplets= []
+  for video_index in range(predictions.shape[0]):
+    prediction_triplets.extend(top_k_triplets(predictions[video_index],labels[video_index], k))
+  out_predictions = [[] for v in range(num_classes)]
+  out_labels = [[] for v in range(num_classes)]
+  for triplet in prediction_triplets:
+    out_predictions[triplet[0]].append(triplet[1])
+    out_labels[triplet[0]].append(triplet[2])
+  out_true_positives = [numpy.sum(labels[:,i]) for i in range(num_classes)]
+
+  return out_predictions, out_labels, out_true_positives
+
+def top_k_triplets(predictions, labels, k=20):
+  """Get the top_k for a 1-d numpy array. Returns a sparse list of tuples in
+  (prediction, class) format"""
+  m = len(predictions)
+  k = min(k, m)
+  indices = numpy.argpartition(predictions, -k)[-k:]
+  return [(index, predictions[index], labels[index]) for index in indices]
+
+class EvaluationMetrics(object):
+  """A class to store the evaluation metrics."""
+
+  def __init__(self, num_class, top_k):
+    """Construct an EvaluationMetrics object to store the evaluation metrics.
+
+    Args:
+      num_class: A positive integer specifying the number of classes.
+      top_k: A positive integer specifying how many predictions are considered per video.
+
+    Raises:
+      ValueError: An error occurred when MeanAveragePrecisionCalculator cannot
+        not be constructed.
+    """
+    self.sum_hit_at_one = 0.0
+    self.sum_perr = 0.0
+    self.sum_loss = 0.0
+    self.map_calculator = map_calculator.MeanAveragePrecisionCalculator(num_class)
+    self.global_ap_calculator = ap_calculator.AveragePrecisionCalculator()
+    self.top_k = top_k
+    self.num_examples = 0
+
+  def accumulate(self, predictions, labels, loss):
+    """Accumulate the metrics calculated locally for this mini-batch.
+
+    Args:
+      predictions: A numpy matrix containing the outputs of the model.
+        Dimensions are 'batch' x 'num_classes'.
+      labels: A numpy matrix containing the ground truth labels.
+        Dimensions are 'batch' x 'num_classes'.
+      loss: A numpy array containing the loss for each sample.
+
+    Returns:
+      dictionary: A dictionary storing the metrics for the mini-batch.
+
+    Raises:
+      ValueError: An error occurred when the shape of predictions and actuals
+        does not match.
+    """
+    batch_size = labels.shape[0]
+    mean_hit_at_one = calculate_hit_at_one(predictions, labels)
+    mean_perr = calculate_precision_at_equal_recall_rate(predictions, labels)
+    mean_loss = numpy.mean(loss)
+
+    # Take the top 20 predictions.
+    sparse_predictions, sparse_labels, num_positives = top_k_by_class(predictions, labels, self.top_k)
+    self.map_calculator.accumulate(sparse_predictions, sparse_labels, num_positives)
+    self.global_ap_calculator.accumulate(flatten(sparse_predictions), flatten(sparse_labels), sum(num_positives))
+
+    self.num_examples += batch_size
+    self.sum_hit_at_one += mean_hit_at_one * batch_size
+    self.sum_perr += mean_perr * batch_size
+    self.sum_loss += mean_loss * batch_size
+
+    return {"hit_at_one": mean_hit_at_one, "perr": mean_perr, "loss": mean_loss}
+
+  def get(self):
+    """Calculate the evaluation metrics for the whole epoch.
+
+    Raises:
+      ValueError: If no examples were accumulated.
+
+    Returns:
+      dictionary: a dictionary storing the evaluation metrics for the epoch. The
+        dictionary has the fields: avg_hit_at_one, avg_perr, avg_loss, and
+        aps (default nan).
+    """
+    if self.num_examples <= 0:
+      raise ValueError("total_sample must be positive.")
+    avg_hit_at_one = self.sum_hit_at_one / self.num_examples
+    avg_perr = self.sum_perr / self.num_examples
+    avg_loss = self.sum_loss / self.num_examples
+
+    aps = self.map_calculator.peek_map_at_n()
+    gap = self.global_ap_calculator.peek_ap_at_n()
+
+    epoch_info_dict = {}
+    return {"avg_hit_at_one": avg_hit_at_one, "avg_perr": avg_perr,
+            "avg_loss": avg_loss, "aps": aps, "gap": gap}
+
+  def clear(self):
+    """Clear the evaluation metrics and reset the EvaluationMetrics object."""
+    self.sum_hit_at_one = 0.0
+    self.sum_perr = 0.0
+    self.sum_loss = 0.0
+    self.map_calculator.clear()
+    self.global_ap_calculator.clear()
+    self.num_examples = 0
+
+
+
+
+
+
+  //export_model.py
+# Copyright 2016 Google Inc. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS-IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Utilities to export a model for batch prediction."""
+
+import tensorflow as tf
+import tensorflow.contrib.slim as slim
+
+from tensorflow.python.saved_model import builder as saved_model_builder
+from tensorflow.python.saved_model import signature_constants
+from tensorflow.python.saved_model import signature_def_utils
+from tensorflow.python.saved_model import tag_constants
+from tensorflow.python.saved_model import utils as saved_model_utils
+
+_TOP_PREDICTIONS_IN_OUTPUT = 20
+
+class ModelExporter(object):
+
+  def __init__(self, frame_features, model, reader):
+    self.frame_features = frame_features
+    self.model = model
+    self.reader = reader
+
+    with tf.Graph().as_default() as graph:
+      self.inputs, self.outputs = self.build_inputs_and_outputs()
+      self.graph = graph
+      self.saver = tf.train.Saver(tf.trainable_variables(), sharded=True)
+
+  def export_model(self, model_dir, global_step_val, last_checkpoint):
+    """Exports the model so that it can used for batch predictions."""
+
+    with self.graph.as_default():
+      with tf.Session() as session:
+        session.run(tf.global_variables_initializer())
+        self.saver.restore(session, last_checkpoint)
+
+        signature = signature_def_utils.build_signature_def(
+            inputs=self.inputs,
+            outputs=self.outputs,
+            method_name=signature_constants.PREDICT_METHOD_NAME)
+
+        signature_map = {signature_constants.DEFAULT_SERVING_SIGNATURE_DEF_KEY:
+                         signature}
+
+        model_builder = saved_model_builder.SavedModelBuilder(model_dir)
+        model_builder.add_meta_graph_and_variables(session,
+            tags=[tag_constants.SERVING],
+            signature_def_map=signature_map,
+            clear_devices=True)
+        model_builder.save()
+
+  def build_inputs_and_outputs(self):
+    if self.frame_features:
+      serialized_examples = tf.placeholder(tf.string, shape=(None,))
+
+      fn = lambda x: self.build_prediction_graph(x)
+      video_id_output, top_indices_output, top_predictions_output = (
+          tf.map_fn(fn, serialized_examples,
+                    dtype=(tf.string, tf.int32, tf.float32)))
+
+    else:
+      serialized_examples = tf.placeholder(tf.string, shape=(None,))
+
+      video_id_output, top_indices_output, top_predictions_output = (
+          self.build_prediction_graph(serialized_examples))
+
+    inputs = {"example_bytes":
+              saved_model_utils.build_tensor_info(serialized_examples)}
+
+    outputs = {
+        "video_id": saved_model_utils.build_tensor_info(video_id_output),
+        "class_indexes": saved_model_utils.build_tensor_info(top_indices_output),
+        "predictions": saved_model_utils.build_tensor_info(top_predictions_output)}
+
+    return inputs, outputs
+
+  def build_prediction_graph(self, serialized_examples):
+    video_id, model_input_raw, labels_batch, num_frames = (
+        self.reader.prepare_serialized_examples(serialized_examples))
+
+    feature_dim = len(model_input_raw.get_shape()) - 1
+    model_input = tf.nn.l2_normalize(model_input_raw, feature_dim)
+
+    with tf.variable_scope("tower"):
+      result = self.model.create_model(
+          model_input,
+          num_frames=num_frames,
+          vocab_size=self.reader.num_classes,
+          labels=labels_batch,
+          is_training=False)
+
+      for variable in slim.get_model_variables():
+        tf.summary.histogram(variable.op.name, variable)
+
+      predictions = result["predictions"]
+
+      top_predictions, top_indices = tf.nn.top_k(predictions,
+          _TOP_PREDICTIONS_IN_OUTPUT)
+    return video_id, top_indices, top_predictions
+
+
+
+
+  //frame_level_models.py
+# Copyright 2016 Google Inc. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS-IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Contains a collection of models which operate on variable-length sequences.
+"""
+import math
+
+import models
+import video_level_models
+import tensorflow as tf
+import model_utils as utils
+
+import tensorflow.contrib.slim as slim
+from tensorflow import flags
+
+FLAGS = flags.FLAGS
+flags.DEFINE_integer("iterations", 30,
+                     "Number of frames per batch for DBoF.")
+flags.DEFINE_bool("dbof_add_batch_norm", True,
+                  "Adds batch normalization to the DBoF model.")
+flags.DEFINE_bool(
+    "sample_random_frames", True,
+    "If true samples random frames (for frame level models). If false, a random"
+    "sequence of frames is sampled instead.")
+flags.DEFINE_integer("dbof_cluster_size", 8192,
+                     "Number of units in the DBoF cluster layer.")
+flags.DEFINE_integer("dbof_hidden_size", 1024,
+                     "Number of units in the DBoF hidden layer.")
+flags.DEFINE_string("dbof_pooling_method", "max",
+                    "The pooling method used in the DBoF cluster layer. "
+                    "Choices are 'average' and 'max'.")
+flags.DEFINE_string("video_level_classifier_model", "MoeModel",
+                    "Some Frame-Level models can be decomposed into a "
+                    "generalized pooling operation followed by a "
+                    "classifier layer")
+flags.DEFINE_integer("lstm_cells", 1024, "Number of LSTM cells.")
+flags.DEFINE_integer("lstm_layers", 2, "Number of LSTM layers.")
+
+class FrameLevelLogisticModel(models.BaseModel):
+
+  def create_model(self, model_input, vocab_size, num_frames, **unused_params):
+    """Creates a model which uses a logistic classifier over the average of the
+    frame-level features.
+
+    This class is intended to be an example for implementors of frame level
+    models. If you want to train a model over averaged features it is more
+    efficient to average them beforehand rather than on the fly.
+
+    Args:
+      model_input: A 'batch_size' x 'max_frames' x 'num_features' matrix of
+                   input features.
+      vocab_size: The number of classes in the dataset.
+      num_frames: A vector of length 'batch' which indicates the number of
+           frames for each video (before padding).
+
+    Returns:
+      A dictionary with a tensor containing the probability predictions of the
+      model in the 'predictions' key. The dimensions of the tensor are
+      'batch_size' x 'num_classes'.
+    """
+    num_frames = tf.cast(tf.expand_dims(num_frames, 1), tf.float32)
+    feature_size = model_input.get_shape().as_list()[2]
+
+    denominators = tf.reshape(
+        tf.tile(num_frames, [1, feature_size]), [-1, feature_size])
+    avg_pooled = tf.reduce_sum(model_input,
+                               axis=[1]) / denominators
+
+    output = slim.fully_connected(
+        avg_pooled, vocab_size, activation_fn=tf.nn.sigmoid,
+        weights_regularizer=slim.l2_regularizer(1e-8))
+    return {"predictions": output}
+
+class DbofModel(models.BaseModel):
+  """Creates a Deep Bag of Frames model.
+
+  The model projects the features for each frame into a higher dimensional
+  'clustering' space, pools across frames in that space, and then
+  uses a configurable video-level model to classify the now aggregated features.
+
+  The model will randomly sample either frames or sequences of frames during
+  training to speed up convergence.
+
+  Args:
+    model_input: A 'batch_size' x 'max_frames' x 'num_features' matrix of
+                 input features.
+    vocab_size: The number of classes in the dataset.
+    num_frames: A vector of length 'batch' which indicates the number of
+         frames for each video (before padding).
+
+  Returns:
+    A dictionary with a tensor containing the probability predictions of the
+    model in the 'predictions' key. The dimensions of the tensor are
+    'batch_size' x 'num_classes'.
+  """
+
+  def create_model(self,
+                   model_input,
+                   vocab_size,
+                   num_frames,
+                   iterations=None,
+                   add_batch_norm=None,
+                   sample_random_frames=None,
+                   cluster_size=None,
+                   hidden_size=None,
+                   is_training=True,
+                   **unused_params):
+    iterations = iterations or FLAGS.iterations
+    add_batch_norm = add_batch_norm or FLAGS.dbof_add_batch_norm
+    random_frames = sample_random_frames or FLAGS.sample_random_frames
+    cluster_size = cluster_size or FLAGS.dbof_cluster_size
+    hidden1_size = hidden_size or FLAGS.dbof_hidden_size
+
+    num_frames = tf.cast(tf.expand_dims(num_frames, 1), tf.float32)
+    if random_frames:
+      model_input = utils.SampleRandomFrames(model_input, num_frames,
+                                             iterations)
+    else:
+      model_input = utils.SampleRandomSequence(model_input, num_frames,
+                                               iterations)
+    max_frames = model_input.get_shape().as_list()[1]
+    feature_size = model_input.get_shape().as_list()[2]
+    reshaped_input = tf.reshape(model_input, [-1, feature_size])
+    tf.summary.histogram("input_hist", reshaped_input)
+
+    if add_batch_norm:
+      reshaped_input = slim.batch_norm(
+          reshaped_input,
+          center=True,
+          scale=True,
+          is_training=is_training,
+          scope="input_bn")
+
+    cluster_weights = tf.get_variable("cluster_weights",
+      [feature_size, cluster_size],
+      initializer = tf.random_normal_initializer(stddev=1 / math.sqrt(feature_size)))
+    tf.summary.histogram("cluster_weights", cluster_weights)
+    activation = tf.matmul(reshaped_input, cluster_weights)
+    if add_batch_norm:
+      activation = slim.batch_norm(
+          activation,
+          center=True,
+          scale=True,
+          is_training=is_training,
+          scope="cluster_bn")
+    else:
+      cluster_biases = tf.get_variable("cluster_biases",
+        [cluster_size],
+        initializer = tf.random_normal(stddev=1 / math.sqrt(feature_size)))
+      tf.summary.histogram("cluster_biases", cluster_biases)
+      activation += cluster_biases
+    activation = tf.nn.relu6(activation)
+    tf.summary.histogram("cluster_output", activation)
+
+    activation = tf.reshape(activation, [-1, max_frames, cluster_size])
+    activation = utils.FramePooling(activation, FLAGS.dbof_pooling_method)
+
+    hidden1_weights = tf.get_variable("hidden1_weights",
+      [cluster_size, hidden1_size],
+      initializer=tf.random_normal_initializer(stddev=1 / math.sqrt(cluster_size)))
+    tf.summary.histogram("hidden1_weights", hidden1_weights)
+    activation = tf.matmul(activation, hidden1_weights)
+    if add_batch_norm:
+      activation = slim.batch_norm(
+          activation,
+          center=True,
+          scale=True,
+          is_training=is_training,
+          scope="hidden1_bn")
+    else:
+      hidden1_biases = tf.get_variable("hidden1_biases",
+        [hidden1_size],
+        initializer = tf.random_normal_initializer(stddev=0.01))
+      tf.summary.histogram("hidden1_biases", hidden1_biases)
+      activation += hidden1_biases
+    activation = tf.nn.relu6(activation)
+    tf.summary.histogram("hidden1_output", activation)
+
+    aggregated_model = getattr(video_level_models,
+                               FLAGS.video_level_classifier_model)
+    return aggregated_model().create_model(
+        model_input=activation,
+        vocab_size=vocab_size,
+        **unused_params)
+
+class LstmModel(models.BaseModel):
+
+  def create_model(self, model_input, vocab_size, num_frames, **unused_params):
+    """Creates a model which uses a stack of LSTMs to represent the video.
+
+    Args:
+      model_input: A 'batch_size' x 'max_frames' x 'num_features' matrix of
+                   input features.
+      vocab_size: The number of classes in the dataset.
+      num_frames: A vector of length 'batch' which indicates the number of
+           frames for each video (before padding).
+
+    Returns:
+      A dictionary with a tensor containing the probability predictions of the
+      model in the 'predictions' key. The dimensions of the tensor are
+      'batch_size' x 'num_classes'.
+    """
+    lstm_size = FLAGS.lstm_cells
+    number_of_layers = FLAGS.lstm_layers
+
+    stacked_lstm = tf.contrib.rnn.MultiRNNCell(
+            [
+                tf.contrib.rnn.BasicLSTMCell(
+                    lstm_size, forget_bias=1.0, state_is_tuple=False)
+                for _ in range(number_of_layers)
+                ], state_is_tuple=False)
+
+    loss = 0.0
+
+    outputs, state = tf.nn.dynamic_rnn(stacked_lstm, model_input,
+                                       sequence_length=num_frames,
+                                       dtype=tf.float32)
+
+    aggregated_model = getattr(video_level_models,
+                               FLAGS.video_level_classifier_model)
+
+    return aggregated_model().create_model(
+        model_input=state,
+        vocab_size=vocab_size,
+        **unused_params)
+
+
+
+  //inference.py
+# Copyright 2016 Google Inc. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS-IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Binary for generating predictions over a set of videos."""
+
+import os
+import time
+
+import numpy
+import tensorflow as tf
+
+from tensorflow import app
+from tensorflow import flags
+from tensorflow import gfile
+from tensorflow import logging
+
+import eval_util
+import losses
+import readers
+import utils
+
+FLAGS = flags.FLAGS
+
+if __name__ == '__main__':
+  flags.DEFINE_string("train_dir", "/Downloads/youtube-8m-master/video_level_logistic_model",
+                      "The directory to load the model files from.")
+  flags.DEFINE_string("output_file", "",
+                      "The file to save the predictions to.")
+  flags.DEFINE_string(
+      "input_data_pattern", "",
+      "File glob defining the evaluation dataset in tensorflow.SequenceExample "
+      "format. The SequenceExamples are expected to have an 'rgb' byte array "
+      "sequence feature as well as a 'labels' int64 context feature.")
+
+  # Model flags.
+  flags.DEFINE_bool(
+      "frame_features", False,
+      "If set, then --eval_data_pattern must be frame-level features. "
+      "Otherwise, --eval_data_pattern must be aggregated video-level "
+      "features. The model must also be set appropriately (i.e. to read 3D "
+      "batches VS 4D batches.")
+  flags.DEFINE_integer(
+      "batch_size", 8192,
+      "How many examples to process per batch.")
+  flags.DEFINE_string("feature_names", "mean_rgb", "Name of the feature "
+                      "to use for training.")
+  flags.DEFINE_string("feature_sizes", "1024", "Length of the feature vectors.")
+
+
+  # Other flags.
+  flags.DEFINE_integer("num_readers", 1,
+                       "How many threads to use for reading input files.")
+  flags.DEFINE_integer("top_k", 20,
+                       "How many predictions to output per video.")
+
+def format_lines(video_ids, predictions, top_k):
+  batch_size = len(video_ids)
+  for video_index in range(batch_size):
+    top_indices = numpy.argpartition(predictions[video_index], -top_k)[-top_k:]
+    line = [(class_index, predictions[video_index][class_index])
+            for class_index in top_indices]
+    line = sorted(line, key=lambda p: -p[1])
+    yield video_ids[video_index].decode('utf-8') + "," + " ".join("%i %f" % pair
+                                                  for pair in line) + "\n"
+
+
+def get_input_data_tensors(reader, data_pattern, batch_size, num_readers=1):
+  """Creates the section of the graph which reads the input data.
+
+  Args:
+    reader: A class which parses the input data.
+    data_pattern: A 'glob' style path to the data files.
+    batch_size: How many examples to process at a time.
+    num_readers: How many I/O threads to use.
+
+  Returns:
+    A tuple containing the features tensor, labels tensor, and optionally a
+    tensor containing the number of frames per video. The exact dimensions
+    depend on the reader being used.
+
+  Raises:
+    IOError: If no files matching the given pattern were found.
+  """
+  with tf.name_scope("input"):
+    files = gfile.Glob(data_pattern)
+    if not files:
+      raise IOError("Unable to find input files. data_pattern='" +
+                    data_pattern + "'")
+    logging.info("number of input files: " + str(len(files)))
+    filename_queue = tf.train.string_input_producer(
+        files, num_epochs=1, shuffle=False)
+    examples_and_labels = [reader.prepare_reader(filename_queue)
+                           for _ in range(num_readers)]
+
+    video_id_batch, video_batch, unused_labels, num_frames_batch = (
+        tf.train.batch_join(examples_and_labels,
+                            batch_size=batch_size,
+                            allow_smaller_final_batch=True,
+                            enqueue_many=True))
+    return video_id_batch, video_batch, num_frames_batch
+
+def inference(reader, train_dir, data_pattern, out_file_location, batch_size, top_k):
+  with tf.Session(config=tf.ConfigProto(allow_soft_placement=True)) as sess, gfile.Open(out_file_location, "w+") as out_file:
+    video_id_batch, video_batch, num_frames_batch = get_input_data_tensors(reader, data_pattern, batch_size)
+    latest_checkpoint = tf.train.latest_checkpoint(train_dir)
+    print "Hello"
+    if latest_checkpoint is None:
+
+      raise Exception("unable to find a checkpoint at location: %s" % train_dir)
+    else:
+      meta_graph_location = latest_checkpoint + ".meta"
+      logging.info("loading meta-graph: " + meta_graph_location)
+    saver = tf.train.import_meta_graph(meta_graph_location, clear_devices=True)
+    logging.info("restoring variables from " + latest_checkpoint)
+    saver.restore(sess, latest_checkpoint)
+    input_tensor = tf.get_collection("input_batch_raw")[0]
+    num_frames_tensor = tf.get_collection("num_frames")[0]
+    predictions_tensor = tf.get_collection("predictions")[0]
+
+    # Workaround for num_epochs issue.
+    def set_up_init_ops(variables):
+      init_op_list = []
+      for variable in list(variables):
+        if "train_input" in variable.name:
+          init_op_list.append(tf.assign(variable, 1))
+          variables.remove(variable)
+      init_op_list.append(tf.variables_initializer(variables))
+      return init_op_list
+
+    sess.run(set_up_init_ops(tf.get_collection_ref(
+        tf.GraphKeys.LOCAL_VARIABLES)))
+
+    coord = tf.train.Coordinator()
+    threads = tf.train.start_queue_runners(sess=sess, coord=coord)
+    num_examples_processed = 0
+    start_time = time.time()
+    out_file.write("VideoId,LabelConfidencePairs\n")
+
+    try:
+      while not coord.should_stop():
+          video_id_batch_val, video_batch_val,num_frames_batch_val = sess.run([video_id_batch, video_batch, num_frames_batch])
+          predictions_val, = sess.run([predictions_tensor], feed_dict={input_tensor: video_batch_val, num_frames_tensor: num_frames_batch_val})
+          now = time.time()
+          num_examples_processed += len(video_batch_val)
+          num_classes = predictions_val.shape[1]
+          logging.info("num examples processed: " + str(num_examples_processed) + " elapsed seconds: " + "{0:.2f}".format(now-start_time))
+          for line in format_lines(video_id_batch_val, predictions_val, top_k):
+            out_file.write(line)
+          out_file.flush()
+
+
+    except tf.errors.OutOfRangeError:
+        logging.info('Done with inference. The output file was written to ' + out_file_location)
+    finally:
+        coord.request_stop()
+
+    coord.join(threads)
+    sess.close()
+
+
+def main(unused_argv):
+  logging.set_verbosity(tf.logging.INFO)
+
+  # convert feature_names and feature_sizes to lists of values
+  feature_names, feature_sizes = utils.GetListOfFeatureNamesAndSizes(
+      FLAGS.feature_names, FLAGS.feature_sizes)
+
+  if FLAGS.frame_features:
+    reader = readers.YT8MFrameFeatureReader(feature_names=feature_names,
+                                            feature_sizes=feature_sizes)
+  else:
+    reader = readers.YT8MAggregatedFeatureReader(feature_names=feature_names,
+                                                 feature_sizes=feature_sizes)
+
+  if FLAGS.output_file is "":
+    raise ValueError("'output_file' was not specified. "
+      "Unable to continue with inference.")
+
+  if FLAGS.input_data_pattern is "":
+    raise ValueError("'input_data_pattern' was not specified. "
+      "Unable to continue with inference.")
+
+  inference(reader, FLAGS.train_dir, FLAGS.input_data_pattern,
+    FLAGS.output_file, FLAGS.batch_size, FLAGS.top_k)
+
+
+if __name__ == "__main__":
+  app.run()
+
+
+  //LICENSE
+
+                                 Apache License
+                           Version 2.0, January 2004
+                        http://www.apache.org/licenses/
+
+   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
+
+   1. Definitions.
+
+      "License" shall mean the terms and conditions for use, reproduction,
+      and distribution as defined by Sections 1 through 9 of this document.
+
+      "Licensor" shall mean the copyright owner or entity authorized by
+      the copyright owner that is granting the License.
+
+      "Legal Entity" shall mean the union of the acting entity and all
+      other entities that control, are controlled by, or are under common
+      control with that entity. For the purposes of this definition,
+      "control" means (i) the power, direct or indirect, to cause the
+      direction or management of such entity, whether by contract or
+      otherwise, or (ii) ownership of fifty percent (50%) or more of the
+      outstanding shares, or (iii) beneficial ownership of such entity.
+
+      "You" (or "Your") shall mean an individual or Legal Entity
+      exercising permissions granted by this License.
+
+      "Source" form shall mean the preferred form for making modifications,
+      including but not limited to software source code, documentation
+      source, and configuration files.
+
+      "Object" form shall mean any form resulting from mechanical
+      transformation or translation of a Source form, including but
+      not limited to compiled object code, generated documentation,
+      and conversions to other media types.
+
+      "Work" shall mean the work of authorship, whether in Source or
+      Object form, made available under the License, as indicated by a
+      copyright notice that is included in or attached to the work
+      (an example is provided in the Appendix below).
+
+      "Derivative Works" shall mean any work, whether in Source or Object
+      form, that is based on (or derived from) the Work and for which the
+      editorial revisions, annotations, elaborations, or other modifications
+      represent, as a whole, an original work of authorship. For the purposes
+      of this License, Derivative Works shall not include works that remain
+      separable from, or merely link (or bind by name) to the interfaces of,
+      the Work and Derivative Works thereof.
+
+      "Contribution" shall mean any work of authorship, including
+      the original version of the Work and any modifications or additions
+      to that Work or Derivative Works thereof, that is intentionally
+      submitted to Licensor for inclusion in the Work by the copyright owner
+      or by an individual or Legal Entity authorized to submit on behalf of
+      the copyright owner. For the purposes of this definition, "submitted"
+      means any form of electronic, verbal, or written communication sent
+      to the Licensor or its representatives, including but not limited to
+      communication on electronic mailing lists, source code control systems,
+      and issue tracking systems that are managed by, or on behalf of, the
+      Licensor for the purpose of discussing and improving the Work, but
+      excluding communication that is conspicuously marked or otherwise
+      designated in writing by the copyright owner as "Not a Contribution."
+
+      "Contributor" shall mean Licensor and any individual or Legal Entity
+      on behalf of whom a Contribution has been received by Licensor and
+      subsequently incorporated within the Work.
+
+   2. Grant of Copyright License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      copyright license to reproduce, prepare Derivative Works of,
+      publicly display, publicly perform, sublicense, and distribute the
+      Work and such Derivative Works in Source or Object form.
+
+   3. Grant of Patent License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      (except as stated in this section) patent license to make, have made,
+      use, offer to sell, sell, import, and otherwise transfer the Work,
+      where such license applies only to those patent claims licensable
+      by such Contributor that are necessarily infringed by their
+      Contribution(s) alone or by combination of their Contribution(s)
+      with the Work to which such Contribution(s) was submitted. If You
+      institute patent litigation against any entity (including a
+      cross-claim or counterclaim in a lawsuit) alleging that the Work
+      or a Contribution incorporated within the Work constitutes direct
+      or contributory patent infringement, then any patent licenses
+      granted to You under this License for that Work shall terminate
+      as of the date such litigation is filed.
+
+   4. Redistribution. You may reproduce and distribute copies of the
+      Work or Derivative Works thereof in any medium, with or without
+      modifications, and in Source or Object form, provided that You
+      meet the following conditions:
+
+      (a) You must give any other recipients of the Work or
+          Derivative Works a copy of this License; and
+
+      (b) You must cause any modified files to carry prominent notices
+          stating that You changed the files; and
+
+      (c) You must retain, in the Source form of any Derivative Works
+          that You distribute, all copyright, patent, trademark, and
+          attribution notices from the Source form of the Work,
+          excluding those notices that do not pertain to any part of
+          the Derivative Works; and
+
+      (d) If the Work includes a "NOTICE" text file as part of its
+          distribution, then any Derivative Works that You distribute must
+          include a readable copy of the attribution notices contained
+          within such NOTICE file, excluding those notices that do not
+          pertain to any part of the Derivative Works, in at least one
+          of the following places: within a NOTICE text file distributed
+          as part of the Derivative Works; within the Source form or
+          documentation, if provided along with the Derivative Works; or,
+          within a display generated by the Derivative Works, if and
+          wherever such third-party notices normally appear. The contents
+          of the NOTICE file are for informational purposes only and
+          do not modify the License. You may add Your own attribution
+          notices within Derivative Works that You distribute, alongside
+          or as an addendum to the NOTICE text from the Work, provided
+          that such additional attribution notices cannot be construed
+          as modifying the License.
+
+      You may add Your own copyright statement to Your modifications and
+      may provide additional or different license terms and conditions
+      for use, reproduction, or distribution of Your modifications, or
+      for any such Derivative Works as a whole, provided Your use,
+      reproduction, and distribution of the Work otherwise complies with
+      the conditions stated in this License.
+
+   5. Submission of Contributions. Unless You explicitly state otherwise,
+      any Contribution intentionally submitted for inclusion in the Work
+      by You to the Licensor shall be under the terms and conditions of
+      this License, without any additional terms or conditions.
+      Notwithstanding the above, nothing herein shall supersede or modify
+      the terms of any separate license agreement you may have executed
+      with Licensor regarding such Contributions.
+
+   6. Trademarks. This License does not grant permission to use the trade
+      names, trademarks, service marks, or product names of the Licensor,
+      except as required for reasonable and customary use in describing the
+      origin of the Work and reproducing the content of the NOTICE file.
+
+   7. Disclaimer of Warranty. Unless required by applicable law or
+      agreed to in writing, Licensor provides the Work (and each
+      Contributor provides its Contributions) on an "AS IS" BASIS,
+      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+      implied, including, without limitation, any warranties or conditions
+      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
+      PARTICULAR PURPOSE. You are solely responsible for determining the
+      appropriateness of using or redistributing the Work and assume any
+      risks associated with Your exercise of permissions under this License.
+
+   8. Limitation of Liability. In no event and under no legal theory,
+      whether in tort (including negligence), contract, or otherwise,
+      unless required by applicable law (such as deliberate and grossly
+      negligent acts) or agreed to in writing, shall any Contributor be
+      liable to You for damages, including any direct, indirect, special,
+      incidental, or consequential damages of any character arising as a
+      result of this License or out of the use or inability to use the
+      Work (including but not limited to damages for loss of goodwill,
+      work stoppage, computer failure or malfunction, or any and all
+      other commercial damages or losses), even if such Contributor
+      has been advised of the possibility of such damages.
+
+   9. Accepting Warranty or Additional Liability. While redistributing
+      the Work or Derivative Works thereof, You may choose to offer,
+      and charge a fee for, acceptance of support, warranty, indemnity,
+      or other liability obligations and/or rights consistent with this
+      License. However, in accepting such obligations, You may act only
+      on Your own behalf and on Your sole responsibility, not on behalf
+      of any other Contributor, and only if You agree to indemnify,
+      defend, and hold each Contributor harmless for any liability
+      incurred by, or claims asserted against, such Contributor by reason
+      of your accepting any such warranty or additional liability.
+
+   END OF TERMS AND CONDITIONS
+
+   APPENDIX: How to apply the Apache License to your work.
+
+      To apply the Apache License to your work, attach the following
+      boilerplate notice, with the fields enclosed by brackets "[]"
+      replaced with your own identifying information. (Don't include
+      the brackets!)  The text should be enclosed in the appropriate
+      comment syntax for the file format. We also recommend that a
+      file or class name and description of purpose be included on the
+      same "printed page" as the copyright notice for easier
+      identification within third-party archives.
+
+   Copyright [yyyy] [name of copyright owner]
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+
+
+
+  //losses.py
+# Copyright 2016 Google Inc. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS-IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Provides definitions for non-regularized training or test losses."""
+
+import tensorflow as tf
+
+
+class BaseLoss(object):
+  """Inherit from this class when implementing new losses."""
+
+  def calculate_loss(self, unused_predictions, unused_labels, **unused_params):
+    """Calculates the average loss of the examples in a mini-batch.
+
+     Args:
+      unused_predictions: a 2-d tensor storing the prediction scores, in which
+        each row represents a sample in the mini-batch and each column
+        represents a class.
+      unused_labels: a 2-d tensor storing the labels, which has the same shape
+        as the unused_predictions. The labels must be in the range of 0 and 1.
+      unused_params: loss specific parameters.
+
+    Returns:
+      A scalar loss tensor.
+    """
+    raise NotImplementedError()
+
+
+class CrossEntropyLoss(BaseLoss):
+  """Calculate the cross entropy loss between the predictions and labels.
+  """
+
+  def calculate_loss(self, predictions, labels, **unused_params):
+    with tf.name_scope("loss_xent"):
+      epsilon = 10e-6
+      float_labels = tf.cast(labels, tf.float32)
+      cross_entropy_loss = float_labels * tf.log(predictions + epsilon) + (
+          1 - float_labels) * tf.log(1 - predictions + epsilon)
+      cross_entropy_loss = tf.negative(cross_entropy_loss)
+      return tf.reduce_mean(tf.reduce_sum(cross_entropy_loss, 1))
+
+
+class HingeLoss(BaseLoss):
+  """Calculate the hinge loss between the predictions and labels.
+
+  Note the subgradient is used in the backpropagation, and thus the optimization
+  may converge slower. The predictions trained by the hinge loss are between -1
+  and +1.
+  """
+
+  def calculate_loss(self, predictions, labels, b=1.0, **unused_params):
+    with tf.name_scope("loss_hinge"):
+      float_labels = tf.cast(labels, tf.float32)
+      all_zeros = tf.zeros(tf.shape(float_labels), dtype=tf.float32)
+      all_ones = tf.ones(tf.shape(float_labels), dtype=tf.float32)
+      sign_labels = tf.subtract(tf.scalar_mul(2, float_labels), all_ones)
+      hinge_loss = tf.maximum(
+          all_zeros, tf.scalar_mul(b, all_ones) - sign_labels * predictions)
+      return tf.reduce_mean(tf.reduce_sum(hinge_loss, 1))
+
+
+class SoftmaxLoss(BaseLoss):
+  """Calculate the softmax loss between the predictions and labels.
+
+  The function calculates the loss in the following way: first we feed the
+  predictions to the softmax activation function and then we calculate
+  the minus linear dot product between the logged softmax activations and the
+  normalized ground truth label.
+
+  It is an extension to the one-hot label. It allows for more than one positive
+  labels for each sample.
+  """
+
+  def calculate_loss(self, predictions, labels, **unused_params):
+    with tf.name_scope("loss_softmax"):
+      epsilon = 10e-8
+      float_labels = tf.cast(labels, tf.float32)
+      # l1 normalization (labels are no less than 0)
+      label_rowsum = tf.maximum(
+          tf.reduce_sum(float_labels, 1, keep_dims=True),
+          epsilon)
+      norm_float_labels = tf.div(float_labels, label_rowsum)
+      softmax_outputs = tf.nn.softmax(predictions)
+      softmax_loss = tf.negative(tf.reduce_sum(
+          tf.multiply(norm_float_labels, tf.log(softmax_outputs)), 1))
+    return tf.reduce_mean(softmax_loss)
+
+
+
+
+  //mean_average_precision_calculator.py
+# Copyright 2016 Google Inc. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS-IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Calculate the mean average precision.
+
+It provides an interface for calculating mean average precision
+for an entire list or the top-n ranked items.
+
+Example usages:
+We first call the function accumulate many times to process parts of the ranked
+list. After processing all the parts, we call peek_map_at_n
+to calculate the mean average precision.
+
+```
+import random
+
+p = np.array([[random.random() for _ in xrange(50)] for _ in xrange(1000)])
+a = np.array([[random.choice([0, 1]) for _ in xrange(50)]
+     for _ in xrange(1000)])
+
+# mean average precision for 50 classes.
+calculator = mean_average_precision_calculator.MeanAveragePrecisionCalculator(
+            num_class=50)
+calculator.accumulate(p, a)
+aps = calculator.peek_map_at_n()
+```
+"""
+
+import numpy
+import average_precision_calculator
+
+
+class MeanAveragePrecisionCalculator(object):
+  """This class is to calculate mean average precision.
+  """
+
+  def __init__(self, num_class):
+    """Construct a calculator to calculate the (macro) average precision.
+
+    Args:
+      num_class: A positive Integer specifying the number of classes.
+      top_n_array: A list of positive integers specifying the top n for each
+      class. The top n in each class will be used to calculate its average
+      precision at n.
+      The size of the array must be num_class.
+
+    Raises:
+      ValueError: An error occurred when num_class is not a positive integer;
+      or the top_n_array is not a list of positive integers.
+    """
+    if not isinstance(num_class, int) or num_class <= 1:
+      raise ValueError("num_class must be a positive integer.")
+
+    self._ap_calculators = []  # member of AveragePrecisionCalculator
+    self._num_class = num_class  # total number of classes
+    for i in range(num_class):
+      self._ap_calculators.append(
+          average_precision_calculator.AveragePrecisionCalculator())
+
+  def accumulate(self, predictions, actuals, num_positives=None):
+    """Accumulate the predictions and their ground truth labels.
+
+    Args:
+      predictions: A list of lists storing the prediction scores. The outer
+      dimension corresponds to classes.
+      actuals: A list of lists storing the ground truth labels. The dimensions
+      should correspond to the predictions input. Any value
+      larger than 0 will be treated as positives, otherwise as negatives.
+      num_positives: If provided, it is a list of numbers representing the
+      number of true positives for each class. If not provided, the number of
+      true positives will be inferred from the 'actuals' array.
+
+    Raises:
+      ValueError: An error occurred when the shape of predictions and actuals
+      does not match.
+    """
+    if not num_positives:
+      num_positives = [None for i in predictions.shape[1]]
+
+    calculators = self._ap_calculators
+    for i in range(len(predictions)):
+      calculators[i].accumulate(predictions[i], actuals[i], num_positives[i])
+
+  def clear(self):
+    for calculator in self._ap_calculators:
+      calculator.clear()
+
+  def is_empty(self):
+    return ([calculator.heap_size for calculator in self._ap_calculators] ==
+            [0 for _ in range(self._num_class)])
+
+  def peek_map_at_n(self):
+    """Peek the non-interpolated mean average precision at n.
+
+    Returns:
+      An array of non-interpolated average precision at n (default 0) for each
+      class.
+    """
+    aps = [self._ap_calculators[i].peek_ap_at_n()
+           for i in range(self._num_class)]
+    return aps
+
+
+
+  //model_utils.py
+# Copyright 2016 Google Inc. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS-IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Contains a collection of util functions for model construction.
+"""
+import numpy
+import tensorflow as tf
+from tensorflow import logging
+from tensorflow import flags
+import tensorflow.contrib.slim as slim
+
+def SampleRandomSequence(model_input, num_frames, num_samples):
+  """Samples a random sequence of frames of size num_samples.
+
+  Args:
+    model_input: A tensor of size batch_size x max_frames x feature_size
+    num_frames: A tensor of size batch_size x 1
+    num_samples: A scalar
+
+  Returns:
+    `model_input`: A tensor of size batch_size x num_samples x feature_size
+  """
+
+  batch_size = tf.shape(model_input)[0]
+  frame_index_offset = tf.tile(
+      tf.expand_dims(tf.range(num_samples), 0), [batch_size, 1])
+  max_start_frame_index = tf.maximum(num_frames - num_samples, 0)
+  start_frame_index = tf.cast(
+      tf.multiply(
+          tf.random_uniform([batch_size, 1]),
+          tf.cast(max_start_frame_index + 1, tf.float32)), tf.int32)
+  frame_index = tf.minimum(start_frame_index + frame_index_offset,
+                           tf.cast(num_frames - 1, tf.int32))
+  batch_index = tf.tile(
+      tf.expand_dims(tf.range(batch_size), 1), [1, num_samples])
+  index = tf.stack([batch_index, frame_index], 2)
+  return tf.gather_nd(model_input, index)
+
+
+def SampleRandomFrames(model_input, num_frames, num_samples):
+  """Samples a random set of frames of size num_samples.
+
+  Args:
+    model_input: A tensor of size batch_size x max_frames x feature_size
+    num_frames: A tensor of size batch_size x 1
+    num_samples: A scalar
+
+  Returns:
+    `model_input`: A tensor of size batch_size x num_samples x feature_size
+  """
+  batch_size = tf.shape(model_input)[0]
+  frame_index = tf.cast(
+      tf.multiply(
+          tf.random_uniform([batch_size, num_samples]),
+          tf.tile(tf.cast(num_frames, tf.float32), [1, num_samples])), tf.int32)
+  batch_index = tf.tile(
+      tf.expand_dims(tf.range(batch_size), 1), [1, num_samples])
+  index = tf.stack([batch_index, frame_index], 2)
+  return tf.gather_nd(model_input, index)
+
+def FramePooling(frames, method, **unused_params):
+  """Pools over the frames of a video.
+
+  Args:
+    frames: A tensor with shape [batch_size, num_frames, feature_size].
+    method: "average", "max", "attention", or "none".
+  Returns:
+    A tensor with shape [batch_size, feature_size] for average, max, or
+    attention pooling. A tensor with shape [batch_size*num_frames, feature_size]
+    for none pooling.
+
+  Raises:
+    ValueError: if method is other than "average", "max", "attention", or
+    "none".
+  """
+  if method == "average":
+    return tf.reduce_mean(frames, 1)
+  elif method == "max":
+    return tf.reduce_max(frames, 1)
+  elif method == "none":
+    feature_size = frames.shape_as_list()[2]
+    return tf.reshape(frames, [-1, feature_size])
+  else:
+    raise ValueError("Unrecognized pooling method: %s" % method)
+
+
+
+
+  //models.py
+# Copyright 2016 Google Inc. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS-IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Contains the base class for models."""
+
+class BaseModel(object):
+  """Inherit from this class when implementing new models."""
+
+  def create_model(self, unused_model_input, **unused_params):
+    raise NotImplementedError()
+
+
+
+
+  //readers.py
+# Copyright 2016 Google Inc. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS-IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Provides readers configured for different datasets."""
+
+import tensorflow as tf
+import utils
+
+from tensorflow import logging
+def resize_axis(tensor, axis, new_size, fill_value=0):
+  """Truncates or pads a tensor to new_size on on a given axis.
+
+  Truncate or extend tensor such that tensor.shape[axis] == new_size. If the
+  size increases, the padding will be performed at the end, using fill_value.
+
+  Args:
+    tensor: The tensor to be resized.
+    axis: An integer representing the dimension to be sliced.
+    new_size: An integer or 0d tensor representing the new value for
+      tensor.shape[axis].
+    fill_value: Value to use to fill any new entries in the tensor. Will be
+      cast to the type of tensor.
+
+  Returns:
+    The resized tensor.
+  """
+  tensor = tf.convert_to_tensor(tensor)
+  shape = tf.unstack(tf.shape(tensor))
+
+  pad_shape = shape[:]
+  pad_shape[axis] = tf.maximum(0, new_size - shape[axis])
+
+  shape[axis] = tf.minimum(shape[axis], new_size)
+  shape = tf.stack(shape)
+
+  resized = tf.concat([
+      tf.slice(tensor, tf.zeros_like(shape), shape),
+      tf.fill(tf.stack(pad_shape), tf.cast(fill_value, tensor.dtype))
+  ], axis)
+
+  # Update shape.
+  new_shape = tensor.get_shape().as_list()  # A copy is being made.
+  new_shape[axis] = new_size
+  resized.set_shape(new_shape)
+  return resized
+
+class BaseReader(object):
+  """Inherit from this class when implementing new readers."""
+
+  def prepare_reader(self, unused_filename_queue):
+    """Create a thread for generating prediction and label tensors."""
+    raise NotImplementedError()
+
+
+class YT8MAggregatedFeatureReader(BaseReader):
+  """Reads TFRecords of pre-aggregated Examples.
+
+  The TFRecords must contain Examples with a sparse int64 'labels' feature and
+  a fixed length float32 feature, obtained from the features in 'feature_name'.
+  The float features are assumed to be an average of dequantized values.
+  """
+
+  def __init__(self,
+               num_classes=4716,
+               feature_sizes=[1024],
+               feature_names=["mean_inc3"]):
+    """Construct a YT8MAggregatedFeatureReader.
+
+    Args:
+      num_classes: a positive integer for the number of classes.
+      feature_sizes: positive integer(s) for the feature dimensions as a list.
+      feature_names: the feature name(s) in the tensorflow record as a list.
+    """
+
+    assert len(feature_names) == len(feature_sizes), \
+    "length of feature_names (={}) != length of feature_sizes (={})".format( \
+    len(feature_names), len(feature_sizes))
+
+    self.num_classes = num_classes
+    self.feature_sizes = feature_sizes
+    self.feature_names = feature_names
+
+  def prepare_reader(self, filename_queue, batch_size=1024):
+    """Creates a single reader thread for pre-aggregated YouTube 8M Examples.
+
+    Args:
+      filename_queue: A tensorflow queue of filename locations.
+
+    Returns:
+      A tuple of video indexes, features, labels, and padding data.
+    """
+    reader = tf.TFRecordReader()
+    _, serialized_examples = reader.read_up_to(filename_queue, batch_size)
+
+    tf.add_to_collection("serialized_examples", serialized_examples)
+    return self.prepare_serialized_examples(serialized_examples)
+
+  def prepare_serialized_examples(self, serialized_examples):
+    # set the mapping from the fields to data types in the proto
+    num_features = len(self.feature_names)
+    assert num_features > 0, "self.feature_names is empty!"
+    assert len(self.feature_names) == len(self.feature_sizes), \
+    "length of feature_names (={}) != length of feature_sizes (={})".format( \
+    len(self.feature_names), len(self.feature_sizes))
+
+    feature_map = {"video_id": tf.FixedLenFeature([], tf.string),
+                   "labels": tf.VarLenFeature(tf.int64)}
+    for feature_index in range(num_features):
+      feature_map[self.feature_names[feature_index]] = tf.FixedLenFeature(
+          [self.feature_sizes[feature_index]], tf.float32)
+
+    features = tf.parse_example(serialized_examples, features=feature_map)
+    labels = tf.sparse_to_indicator(features["labels"], self.num_classes)
+    labels.set_shape([None, self.num_classes])
+    concatenated_features = tf.concat([
+        features[feature_name] for feature_name in self.feature_names], 1)
+
+    return features["video_id"], concatenated_features, labels, tf.ones([tf.shape(serialized_examples)[0]])
+
+class YT8MFrameFeatureReader(BaseReader):
+  """Reads TFRecords of SequenceExamples.
+
+  The TFRecords must contain SequenceExamples with the sparse in64 'labels'
+  context feature and a fixed length byte-quantized feature vector, obtained
+  from the features in 'feature_names'. The quantized features will be mapped
+  back into a range between min_quantized_value and max_quantized_value.
+  """
+
+  def __init__(self,
+               num_classes=4716,
+               feature_sizes=[1024],
+               feature_names=["inc3"],
+               max_frames=300):
+    """Construct a YT8MFrameFeatureReader.
+
+    Args:
+      num_classes: a positive integer for the number of classes.
+      feature_sizes: positive integer(s) for the feature dimensions as a list.
+      feature_names: the feature name(s) in the tensorflow record as a list.
+      max_frames: the maximum number of frames to process.
+    """
+
+    assert len(feature_names) == len(feature_sizes), \
+    "length of feature_names (={}) != length of feature_sizes (={})".format( \
+    len(feature_names), len(feature_sizes))
+
+    self.num_classes = num_classes
+    self.feature_sizes = feature_sizes
+    self.feature_names = feature_names
+    self.max_frames = max_frames
+
+  def get_video_matrix(self,
+                       features,
+                       feature_size,
+                       max_frames,
+                       max_quantized_value,
+                       min_quantized_value):
+    """Decodes features from an input string and quantizes it.
+
+    Args:
+      features: raw feature values
+      feature_size: length of each frame feature vector
+      max_frames: number of frames (rows) in the output feature_matrix
+      max_quantized_value: the maximum of the quantized value.
+      min_quantized_value: the minimum of the quantized value.
+
+    Returns:
+      feature_matrix: matrix of all frame-features
+      num_frames: number of frames in the sequence
+    """
+    decoded_features = tf.reshape(
+        tf.cast(tf.decode_raw(features, tf.uint8), tf.float32),
+        [-1, feature_size])
+
+    num_frames = tf.minimum(tf.shape(decoded_features)[0], max_frames)
+    feature_matrix = utils.Dequantize(decoded_features,
+                                      max_quantized_value,
+                                      min_quantized_value)
+    feature_matrix = resize_axis(feature_matrix, 0, max_frames)
+    return feature_matrix, num_frames
+
+  def prepare_reader(self,
+                     filename_queue,
+                     max_quantized_value=2,
+                     min_quantized_value=-2):
+    """Creates a single reader thread for YouTube8M SequenceExamples.
+
+    Args:
+      filename_queue: A tensorflow queue of filename locations.
+      max_quantized_value: the maximum of the quantized value.
+      min_quantized_value: the minimum of the quantized value.
+
+    Returns:
+      A tuple of video indexes, video features, labels, and padding data.
+    """
+    reader = tf.TFRecordReader()
+    _, serialized_example = reader.read(filename_queue)
+
+    return self.prepare_serialized_examples(serialized_example,
+        max_quantized_value, min_quantized_value)
+
+  def prepare_serialized_examples(self, serialized_example,
+      max_quantized_value=2, min_quantized_value=-2):
+
+    contexts, features = tf.parse_single_sequence_example(
+        serialized_example,
+        context_features={"video_id": tf.FixedLenFeature(
+            [], tf.string),
+                          "labels": tf.VarLenFeature(tf.int64)},
+        sequence_features={
+            feature_name : tf.FixedLenSequenceFeature([], dtype=tf.string)
+            for feature_name in self.feature_names
+        })
+
+    # read ground truth labels
+    labels = (tf.cast(
+        tf.sparse_to_dense(contexts["labels"].values, (self.num_classes,), 1,
+            validate_indices=False),
+        tf.bool))
+
+    # loads (potentially) different types of features and concatenates them
+    num_features = len(self.feature_names)
+    assert num_features > 0, "No feature selected: feature_names is empty!"
+
+    assert len(self.feature_names) == len(self.feature_sizes), \
+    "length of feature_names (={}) != length of feature_sizes (={})".format( \
+    len(self.feature_names), len(self.feature_sizes))
+
+    num_frames = -1  # the number of frames in the video
+    feature_matrices = [None] * num_features  # an array of different features
+    for feature_index in range(num_features):
+      feature_matrix, num_frames_in_this_feature = self.get_video_matrix(
+          features[self.feature_names[feature_index]],
+          self.feature_sizes[feature_index],
+          self.max_frames,
+          max_quantized_value,
+          min_quantized_value)
+      if num_frames == -1:
+        num_frames = num_frames_in_this_feature
+      else:
+        tf.assert_equal(num_frames, num_frames_in_this_feature)
+
+      feature_matrices[feature_index] = feature_matrix
+
+    # cap the number of frames at self.max_frames
+    num_frames = tf.minimum(num_frames, self.max_frames)
+
+    # concatenate different features
+    video_matrix = tf.concat(feature_matrices, 1)
+
+    # convert to batch format.
+    # TODO: Do proper batch reads to remove the IO bottleneck.
+    batch_video_ids = tf.expand_dims(contexts["video_id"], 0)
+    batch_video_matrix = tf.expand_dims(video_matrix, 0)
+    batch_labels = tf.expand_dims(labels, 0)
+    batch_frames = tf.expand_dims(num_frames, 0)
+
+    return batch_video_ids, batch_video_matrix, batch_labels, batch_frames
+
+
+
+
+  //README.md
+# YouTube-8M Tensorflow Starter Code
+
+This repo contains starter code for training and evaluating machine learning
+models over the [YouTube-8M](https://research.google.com/youtube8m/) dataset.
+The code gives an end-to-end working example for reading the dataset, training a
+TensorFlow model, and evaluating the performance of the model. Out of the box,
+you can train several [model architectures](#overview-of-models) over either
+frame-level or video-level features. The code can easily be extended to train
+your own custom-defined models.
+
+It is possible to train and evaluate on YouTube-8M in two ways: on Google Cloud
+or on your own machine. This README provides instructions for both.
+
+## Table of Contents
+* [Running on Google's Cloud Machine Learning Platform](#running-on-googles-cloud-machine-learning-platform)
+   * [Requirements](#requirements)
+   * [Testing Locally](#testing-locally)
+   * [Training on the Cloud over Video-Level Features](#training-on-video-level-features)
+   * [Evaluation and Inference](#evaluation-and-inference)
+   * [Inference Using Batch Prediction](#inference-using-batch-prediction)
+   * [Accessing Files on Google Cloud](#accessing-files-on-google-cloud)
+   * [Using Frame-Level Features](#using-frame-level-features)
+   * [Using Audio Features](#using-audio-features)
+   * [Using Larger Machine Types](#using-larger-machine-types)
+* [Running on Your Own Machine](#running-on-your-own-machine)
+   * [Requirements](#requirements-1)
+   * [Training on Video-Level Features](#training-on-video-level-features-1)
+   * [Evaluation and Inference](#evaluation-and-inference-1)
+   * [Using Frame-Level Features](#using-frame-level-features-1)
+   * [Using Audio Features](#using-audio-features-1)
+   * [Using GPUs](#using-gpus)
+   * [Ground-Truth Label Files](#ground-truth-label-files)
+* [Overview of Models](#overview-of-models)
+   * [Video-Level Models](#video-level-models)
+   * [Frame-Level Models](#frame-level-models)
+* [Overview of Files](#overview-of-files)
+   * [Training](#training)
+   * [Evaluation](#evaluation)
+   * [Inference](#inference)
+   * [Misc](#misc)
+* [About This Project](#about-this-project)
+
+## Running on Google's Cloud Machine Learning Platform
+
+### Requirements
+
+This option requires you to have an appropriately configured Google Cloud
+Platform account. To create and configure your account, please make sure you
+follow the instructions [here](https://cloud.google.com/ml/docs/how-tos/getting-set-up).
+If you are participating in the Google Cloud & YouTube-8M Video Understanding
+Challenge hosted on [kaggle](https://www.kaggle.com/c/youtube8m), see [these instructions](https://www.kaggle.com/c/youtube8m#getting-started-with-google-cloud) instead.
+
+Please also verify that you have Python 2.7+ and Tensorflow 1.0.0 or higher
+installed by running the following commands:
+
+```sh
+python --version
+python -c 'import tensorflow as tf; print(tf.__version__)'
+```
+
+### Testing Locally
+All gcloud commands should be done from the directory *immediately above* the
+source code. You should be able to see the source code directory if you
+run 'ls'.
+
+As you are developing your own models, you will want to test them
+quickly to flush out simple problems without having to submit them to the cloud.
+You can use the `gcloud beta ml local` set of commands for that.
+
+Here is an example command line for video-level training:
+
+```sh
+gcloud ml-engine local train \
+--package-path=youtube-8m --module-name=youtube-8m.train -- \
+--train_data_pattern='gs://youtube8m-ml/1/video_level/train/train*.tfrecord' \
+--train_dir=/tmp/yt8m_train --model=LogisticModel --start_new_model
+```
+
+You might want to download some training shards locally to speed things up and
+allow you to work offline. The command below will copy 10 out of the 4096
+training data files to the current directory.
+
+```sh
+# Downloads 55MB of data.
+gsutil cp gs://us.data.yt8m.org/1/video_level/train/traina[0-9].tfrecord .
+```
+Once you download the files, you can point the job to them using the
+'train_data_pattern' argument (i.e. instead of pointing to the "gs://..."
+files, you point to the local files).
+
+Once your model is working locally, you can scale up on the Cloud
+which is described below.
+
+### Training on the Cloud over Video-Level Features
+
+The following commands will train a model on Google Cloud
+over video-level features.
+
+```sh
+BUCKET_NAME=gs://${USER}_yt8m_train_bucket
+# (One Time) Create a storage bucket to store training logs and checkpoints.
+gsutil mb -l us-east1 $BUCKET_NAME
+# Submit the training job.
+JOB_NAME=yt8m_train_$(date +%Y%m%d_%H%M%S); gcloud --verbosity=debug ml-engine jobs \
+submit training $JOB_NAME \
+--package-path=youtube-8m --module-name=youtube-8m.train \
+--staging-bucket=$BUCKET_NAME --region=us-east1 \
+--config=youtube-8m/cloudml-gpu.yaml \
+-- --train_data_pattern='gs://youtube8m-ml-us-east1/1/video_level/train/train*.tfrecord' \
+--model=LogisticModel \
+--train_dir=$BUCKET_NAME/yt8m_train_video_level_logistic_model
+```
+
+In the 'gsutil' command above, the 'package-path' flag refers to the directory
+containing the 'train.py' script and more generally the python package which
+should be deployed to the cloud worker. The module-name refers to the specific
+python script which should be executed (in this case the train module).
+
+It may take several minutes before the job starts running on Google Cloud.
+When it starts you will see outputs like the following:
+
+```
+training step 270| Hit@1: 0.68 PERR: 0.52 Loss: 638.453
+training step 271| Hit@1: 0.66 PERR: 0.49 Loss: 635.537
+training step 272| Hit@1: 0.70 PERR: 0.52 Loss: 637.564
+```
+
+At this point you can disconnect your console by pressing "ctrl-c". The
+model will continue to train indefinitely in the Cloud. Later, you can check
+on its progress or halt the job by visiting the
+[Google Cloud ML Jobs console](https://console.cloud.google.com/ml/jobs).
+
+You can train many jobs at once and use tensorboard to compare their performance
+visually.
+
+```sh
+tensorboard --logdir=$BUCKET_NAME --port=8080
+```
+
+Once tensorboard is running, you can access it at the following url:
+[http://localhost:8080](http://localhost:8080).
+If you are using Google Cloud Shell, you can instead click the Web Preview button
+on the upper left corner of the Cloud Shell window and select "Preview on port 8080".
+This will bring up a new browser tab with the Tensorboard view.
+
+### Evaluation and Inference
+Here's how to evaluate a model on the validation dataset:
+
+```sh
+JOB_TO_EVAL=yt8m_train_video_level_logistic_model
+JOB_NAME=yt8m_eval_$(date +%Y%m%d_%H%M%S); gcloud --verbosity=debug ml-engine jobs \
+submit training $JOB_NAME \
+--package-path=youtube-8m --module-name=youtube-8m.eval \
+--staging-bucket=$BUCKET_NAME --region=us-east1 \
+--config=youtube-8m/cloudml-gpu.yaml \
+-- --eval_data_pattern='gs://youtube8m-ml-us-east1/1/video_level/validate/validate*.tfrecord' \
+--model=LogisticModel \
+--train_dir=$BUCKET_NAME/${JOB_TO_EVAL} --run_once=True
+```
+
+And here's how to perform inference with a model on the test set:
+
+```sh
+JOB_TO_EVAL=yt8m_train_video_level_logistic_model
+JOB_NAME=yt8m_inference_$(date +%Y%m%d_%H%M%S); gcloud --verbosity=debug ml-engine jobs \
+submit training $JOB_NAME \
+--package-path=youtube-8m --module-name=youtube-8m.inference \
+--staging-bucket=$BUCKET_NAME --region=us-east1 \
+--config=youtube-8m/cloudml-gpu.yaml \
+-- --input_data_pattern='gs://youtube8m-ml/1/video_level/test/test*.tfrecord' \
+--train_dir=$BUCKET_NAME/${JOB_TO_EVAL} \
+--output_file=$BUCKET_NAME/${JOB_TO_EVAL}/predictions.csv
+```
+
+Note the confusing use of 'training' in the above gcloud commands. Despite the
+name, the 'training' argument really just offers a cloud hosted
+python/tensorflow service. From the point of view of the Cloud Platform, there
+is no distinction between our training and inference jobs. The Cloud ML platform
+also offers specialized functionality for prediction with
+Tensorflow models, but discussing that is beyond the scope of this readme.
+
+Once these job starts executing you will see outputs similar to the
+following for the evaluation code:
+
+```
+examples_processed: 1024 | global_step 447044 | Batch Hit@1: 0.782 | Batch PERR: 0.637 | Batch Loss: 7.821 | Examples_per_sec: 834.658
+```
+
+and the following for the inference code:
+
+```
+num examples processed: 8192 elapsed seconds: 14.85
+```
+
+### Inference Using Batch Prediction
+To perform inference faster, you can also use the Cloud ML batch prediction
+service.
+
+First, find the directory where the training job exported the model:
+
+```
+gsutil list ${BUCKET_NAME}/yt8m_train_video_level_logistic_model/export
+```
+
+You should see an output similar to this one:
+
+```
+${BUCKET_NAME}/yt8m_train_video_level_logistic_model/export/
+${BUCKET_NAME}/yt8m_train_video_level_logistic_model/export/step_1/
+${BUCKET_NAME}/yt8m_train_video_level_logistic_model/export/step_1001/
+${BUCKET_NAME}/yt8m_train_video_level_logistic_model/export/step_2001/
+${BUCKET_NAME}/yt8m_train_video_level_logistic_model/export/step_3001/
+```
+
+Select the latest version of the model that was saved. For instance, in our
+case, we select the version of the model that was saved at step 3001:
+
+```
+EXPORTED_MODEL_DIR=${BUCKET_NAME}/yt8m_train_video_level_logistic_model/export/step_3001/
+```
+
+Start the batch prediction job using the following command:
+
+```
+JOB_NAME=yt8m_batch_predict_$(date +%Y%m%d_%H%M%S); \
+gcloud ml-engine jobs submit prediction ${JOB_NAME} --verbosity=debug \
+--model-dir=${EXPORTED_MODEL_DIR} --data-format=TF_RECORD \
+--input-paths=gs://youtube8m-ml/1/video_level/test/test* \
+--output-path=${BUCKET_NAME}/batch_predict/${JOB_NAME} --region=us-east1 \
+--runtime-version=1.0 --max-worker-count=10
+```
+
+You can check the progress of the job on the
+[Google Cloud ML Jobs console](https://console.cloud.google.com/ml/jobs). To
+have the job complete faster, you can increase 'max-worker-count' to a
+higher value.
+
+Once the batch prediction job has completed, turn its output into a submission
+in the CVS format by running the following commands:
+
+```
+# Copy the output of the batch prediction job to a local directory
+mkdir -p /tmp/batch_predict/${JOB_NAME}
+gsutil -m cp -r ${BUCKET_NAME}/batch_predict/${JOB_NAME}/* /tmp/batch_predict/${JOB_NAME}/
+
+# Convert the output of the batch prediction job into a CVS file ready for submission
+python youtube-8m/convert_prediction_from_json_to_csv.py \
+--json_prediction_files_pattern="/tmp/batch_predict/${JOB_NAME}/prediction.results-*" \
+--csv_output_file="/tmp/batch_predict/${JOB_NAME}/output.csv"
+```
+
+### Accessing Files on Google Cloud
+
+You can browse the storage buckets you created on Google Cloud, for example, to
+access the trained models, prediction CSV files, etc. by visiting the
+[Google Cloud storage browser](https://console.cloud.google.com/storage/browser).
+
+Alternatively, you can use the 'gsutil' command to download the files directly.
+For example, to download the output of the inference code from the previous
+section to your local machine, run:
+
+
+```
+gsutil cp $BUCKET_NAME/${JOB_TO_EVAL}/predictions.csv .
+```
+
+### Using Frame-Level Features
+
+Append
+```sh
+--frame_features=True --model=FrameLevelLogisticModel --feature_names="rgb" \
+--feature_sizes="1024" --batch_size=128 \
+--train_dir=$BUCKET_NAME/yt8m_train_frame_level_logistic_model
+```
+
+to the 'gcloud' commands given above, and change 'video_level' in paths to
+'frame_level'. Here is a sample command to kick-off a frame-level job:
+
+```sh
+JOB_NAME=yt8m_train_$(date +%Y%m%d_%H%M%S); gcloud --verbosity=debug ml-engine jobs \
+submit training $JOB_NAME \
+--package-path=youtube-8m --module-name=youtube-8m.train \
+--staging-bucket=$BUCKET_NAME --region=us-east1 \
+--config=youtube-8m/cloudml-gpu.yaml \
+-- --train_data_pattern='gs://youtube8m-ml-us-east1/1/frame_level/train/train*.tfrecord' \
+--frame_features=True --model=FrameLevelLogisticModel --feature_names="rgb" \
+--feature_sizes="1024" --batch_size=128 \
+--train_dir=$BUCKET_NAME/yt8m_train_frame_level_logistic_model
+```
+
+The 'FrameLevelLogisticModel' is designed to provide equivalent results to a
+logistic model trained over the video-level features. Please look at the
+'video_level_models.py' or 'frame_level_models.py' files to see how to implement
+your own models.
+
+
+### Using Audio Features
+
+The feature files (both Frame-Level and Video-Level) contain two sets of
+features: 1) visual and 2) audio. The code defaults to using the visual
+features only, but it is possible to use audio features instead of (or besides)
+visual features. To specify the (combination of) features to use you must set
+`--feature_names` and `--feature_sizes` flags. The visual and audio features are
+called 'rgb' and 'audio' and have 1024 and 128 dimensions, respectively.
+The two flags take a comma-separated list of values in string. For example, to
+use audio-visual Video-Level features the flags must be set as follows:
+
+```
+--feature_names="mean_rgb, mean_audio" --feature_sizes="1024, 128"
+```
+
+Similarly, to use audio-visual Frame-Level features use:
+
+```
+--feature_names="rgb, audio" --feature_sizes="1024, 128"
+```
+
+**NOTE:** Make sure the set of features and the order in which the appear in the
+lists provided to the two flags above match. Also, the order must match when
+running training, evaluation, or inference.
+
+### Using Larger Machine Types
+
+Some complex frame-level models can take as long as a week to converge when
+using only one GPU. You can train these models more quickly by using more
+powerful machine types which have additional GPUs. To use a configuration with
+4 GPUs, replace the argument to `--config` with `youtube-8m/cloudml-4gpu.yaml`.
+Be careful with this argument as it will also increase the rate you are charged
+by a factor of 4 as well.
+
+## Running on Your Own Machine
+
+### Requirements
+
+The starter code requires Tensorflow. If you haven't installed it yet, follow
+the instructions on [tensorflow.org](https://www.tensorflow.org/install/).
+This code has been tested with Tensorflow 1.0.0. Going forward, we will continue
+to target the latest released version of Tensorflow.
+
+Please verify that you have Python 2.7+ and Tensorflow 1.0.0 or higher
+installed by running the following commands:
+
+```sh
+python --version
+python -c 'import tensorflow as tf; print(tf.__version__)'
+```
+
+You can find complete instructions for downloading the dataset on the
+[YouTube-8M website](https://research.google.com/youtube8m/download.html).
+We recommend downloading the smaller video-level features dataset first when
+getting started. To do that, run:
+
+```
+mkdir -p features; cd features
+curl data.yt8m.org/download.py | partition=1/video_level/train mirror=us python
+```
+
+This will download the full set of video level features, which takes up 31GB
+of space.
+If you are located outside of North America, you should change the flag 'mirror'
+to 'eu' for Europe or 'asia' for Asia to speed up the transfer of the files.
+
+Change 'train' to 'validate'/'test' and re-run the command to download the
+other splits of the dataset.
+
+Change 'video_level' to 'frame_level' to download the frame-level features. The
+complete frame-level features take about 1.71TB of space. You can set the
+environment variable 'shard' to 'm,n' to download only m/n-th of the data. For
+example, to download 1/100-th of the frame-level features from the training set,
+run:
+
+```
+curl data.yt8m.org/download.py | shard=1,100 partition=1/frame_level/train mirror=us python
+```
+
+### Training on Video-Level Features
+
+To start training a logistic model on the video-level features, run
+
+```sh
+MODEL_DIR=/tmp/yt8m
+python train.py --train_data_pattern='/path/to/features/train*.tfrecord' --model=LogisticModel --train_dir=$MODEL_DIR/video_level_logistic_model
+```
+
+Since the dataset is sharded into 4096 individual files, we use a wildcard (\*)
+to represent all of those files.
+
+By default, the training code will frequently write _checkpoint_ files (i.e.
+values of all trainable parameters, at the current training iteration). These
+will be written to the `--train_dir`. If you re-use a `--train_dir`, the trainer
+will first restore the latest checkpoint written in that directory. This only
+works if the architecture of the checkpoint matches the graph created by the
+training code. If you are in active development/debugging phase, consider
+adding `--start_new_model` flag to your run configuration.
+
+### Evaluation and Inference
+
+To evaluate the model, run
+
+```sh
+python eval.py --eval_data_pattern='/path/to/features/validate*.tfrecord' --model=LogisticModel --train_dir=$MODEL_DIR/video_level_logistic_model --run_once=True
+```
+
+As the model is training or evaluating, you can view the results on tensorboard
+by running
+
+```sh
+tensorboard --logdir=$MODEL_DIR
+```
+
+and navigating to http://localhost:6006 in your web browser.
+
+When you are happy with your model, you can generate a csv file of predictions
+from it by running
+
+```sh
+python inference.py --output_file=$MODEL_DIR/video_level_logistic_model/predictions.csv --input_data_pattern='/path/to/features/test*.tfrecord' --train_dir=$MODEL_DIR/video_level_logistic_model
+```
+
+This will output the top 20 predicted labels from the model for every example
+to 'predictions.csv'.
+
+### Using Frame-Level Features
+
+Follow the same instructions as above, appending
+`--frame_features=True --model=FrameLevelLogisticModel --feature_names="rgb"
+--feature_sizes="1024" --train_dir=$MODEL_DIR/frame_level_logistic_model`
+for the 'train.py', 'eval.py', and 'inference.py' scripts.
+
+The 'FrameLevelLogisticModel' is designed to provide equivalent results to a
+logistic model trained over the video-level features. Please look at the
+'models.py' file to see how to implement your own models.
+
+### Using Audio Features
+
+See [Using Audio Features](#using-audio-features) section above.
+
+### Using GPUs
+
+If your Tensorflow installation has GPU support, this code will make use of all
+of your compatible GPUs. You can verify your installation by running
+
+```
+python -c 'import tensorflow as tf; tf.Session()'
+```
+
+This will print out something like the following for each of your compatible
+GPUs.
+
+```
+I tensorflow/core/common_runtime/gpu/gpu_init.cc:102] Found device 0 with properties:
+name: Tesla M40
+major: 5 minor: 2 memoryClockRate (GHz) 1.112
+pciBusID 0000:04:00.0
+Total memory: 11.25GiB
+Free memory: 11.09GiB
+...
+```
+
+If at least one GPU was found, the forward and backward passes will be computed
+with the GPUs, whereas the CPU will be used primarily for the input and output
+pipelines. If you have multiple GPUs, each of them will be given a full batch
+of examples, and the resulting gradients will be summed together before being
+applied. This will increase your effective batch size. For example, if you set
+`batch_size=128` and you have 4 GPUs, this will result in 512 examples being
+evaluated every training step.
+
+### Ground-Truth Label Files
+
+We also provide CSV files containing the ground-truth label information of the
+'train' and 'validation' partitions of the dataset. These files can be
+downloaded using 'gsutil' command:
+
+```
+gsutil cp gs://us.data.yt8m.org/1/ground_truth_labels/train_labels.csv /destination/folder/
+gsutil cp gs://us.data.yt8m.org/1/ground_truth_labels/validate_labels.csv /destination/folder/
+```
+
+or directly using the following links:
+
+*   [http://us.data.yt8m.org/1/ground_truth_labels/train_labels.csv](http://us.data.yt8m.org/1/ground_truth_labels/train_labels.csv)
+*   [http://us.data.yt8m.org/1/ground_truth_labels/validate_labels.csv](http://us.data.yt8m.org/1/ground_truth_labels/validate_labels.csv)
+
+Each line in the files starts with the video id and is followed by the list of
+ground-truth labels corresponding to that video. For example, for a video with
+id 'VIDEO_ID' and two labels 'LABEL1' and 'LABEL2' we store the following line:
+
+```
+VIDEO_ID,LABEL1 LABEL2
+```
+
+## Overview of Models
+
+This sample code contains implementations of the models given in the
+[YouTube-8M technical report](https://arxiv.org/abs/1609.08675).
+
+### Video-Level Models
+*   `LogisticModel`: Linear projection of the output features into the label
+                     space, followed by a sigmoid function to convert logit
+                     values to probabilities.
+*   `MoeModel`: A per-class softmax distribution over a configurable number of
+                logistic classifiers. One of the classifiers in the mixture
+                is not trained, and always predicts 0.
+
+### Frame-Level Models
+* `LstmModel`: Processes the features for each frame using a multi-layered
+               LSTM neural net. The final internal state of the LSTM
+               is input to a video-level model for classification. Note that
+               you will need to change the learning rate to 0.001 when using
+               this model.
+* `DbofModel`: Projects the features for each frame into a higher dimensional
+               'clustering' space, pools across frames in that space, and then
+               uses a video-level model to classify the now aggregated features.
+* `FrameLevelLogisticModel`: Equivalent to 'LogisticModel', but performs
+                             average-pooling on the fly over frame-level
+                             features rather than using pre-aggregated features.
+
+## Overview of Files
+
+### Training
+*   `train.py`: The primary script for training models.
+*   `losses.py`: Contains definitions for loss functions.
+*   `models.py`: Contains the base class for defining a model.
+*   `video_level_models.py`: Contains definitions for models that take
+                             aggregated features as input.
+*   `frame_level_models.py`: Contains definitions for models that take frame-
+                             level features as input.
+*   `model_util.py`: Contains functions that are of general utility for
+                     implementing models.
+*   `export_model.py`: Provides a class to export a model during training
+                       for later use in batch prediction.
+*   `readers.py`: Contains definitions for the Video dataset and Frame
+                  dataset readers.
+
+### Evaluation
+*   `eval.py`: The primary script for evaluating models.
+*   `eval_util.py`: Provides a class that calculates all evaluation metrics.
+*   `average_precision_calculator.py`: Functions for calculating
+                                       average precision.
+*   `mean_average_precision_calculator.py`: Functions for calculating mean
+                                            average precision.
+
+### Inference
+*   `inference.py`: Generates an output file containing predictions of
+                    the model over a set of videos.
+
+### Misc
+*   `README.md`: This documentation.
+*   `utils.py`: Common functions.
+*   `convert_prediction_from_json_to_csv.py`: Converts the JSON output of
+        batch prediction into a CSV file for submission.
+
+## About This Project
+This project is meant help people quickly get started working with the
+[YouTube-8M](https://research.google.com/youtube8m/) dataset.
+This is not an official Google product.
+
+
+
+
+  //train.py
+# Copyright 2016 Google Inc. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS-IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Binary for training Tensorflow models on the YouTube-8M dataset."""
+
+import json
+import os
+import time
+
+import eval_util
+import export_model
+import losses
+import frame_level_models
+import video_level_models
+import readers
+import tensorflow as tf
+import tensorflow.contrib.slim as slim
+from tensorflow import app
+from tensorflow import flags
+from tensorflow import gfile
+from tensorflow import logging
+from tensorflow.python.client import device_lib
+import utils
+
+FLAGS = flags.FLAGS
+
+if __name__ == "__main__":
+  # Dataset flags.
+  flags.DEFINE_string("train_dir", "/tmp/yt8m_model/",
+                      "The directory to save the model files in.")
+  flags.DEFINE_string(
+      "train_data_pattern", "",
+      "File glob for the training dataset. If the files refer to Frame Level "
+      "features (i.e. tensorflow.SequenceExample), then set --reader_type "
+      "format. The (Sequence)Examples are expected to have 'rgb' byte array "
+      "sequence feature as well as a 'labels' int64 context feature.")
+  flags.DEFINE_string("feature_names", "mean_rgb", "Name of the feature "
+                      "to use for training.")
+  flags.DEFINE_string("feature_sizes", "1024", "Length of the feature vectors.")
+
+  # Model flags.
+  flags.DEFINE_bool(
+      "frame_features", False,
+      "If set, then --train_data_pattern must be frame-level features. "
+      "Otherwise, --train_data_pattern must be aggregated video-level "
+      "features. The model must also be set appropriately (i.e. to read 3D "
+      "batches VS 4D batches.")
+  flags.DEFINE_string(
+      "model", "LogisticModel",
+      "Which architecture to use for the model. Models are defined "
+      "in models.py.")
+  flags.DEFINE_bool(
+      "start_new_model", False,
+      "If set, this will not resume from a checkpoint and will instead create a"
+      " new model instance.")
+
+  # Training flags.
+  flags.DEFINE_integer("batch_size", 1024,
+                       "How many examples to process per batch for training.")
+  flags.DEFINE_string("label_loss", "CrossEntropyLoss",
+                      "Which loss function to use for training the model.")
+  flags.DEFINE_float(
+      "regularization_penalty", 1.0,
+      "How much weight to give to the regularization loss (the label loss has "
+      "a weight of 1).")
+  flags.DEFINE_float("base_learning_rate", 0.012,
+                     "Which learning rate to start with.")
+  flags.DEFINE_float("learning_rate_decay", 0.94,
+                     "Learning rate decay factor to be applied every "
+                     "learning_rate_decay_examples.")
+  flags.DEFINE_float("learning_rate_decay_examples", 4000000,
+                     "Multiply current learning rate by learning_rate_decay "
+                     "every learning_rate_decay_examples.")
+  flags.DEFINE_integer("num_epochs", 15,
+                       "How many passes to make over the dataset before "
+                       "halting training.")
+  flags.DEFINE_integer("max_steps", None,
+                       "The maximum number of iterations of the training loop.")
+  flags.DEFINE_integer("export_model_steps", 1000,
+                       "The period, in number of steps, with which the model "
+                       "is exported for batch prediction.")
+
+  # Other flags.
+  flags.DEFINE_integer("num_readers", 8,
+                       "How many threads to use for reading input files.")
+  flags.DEFINE_string("optimizer", "AdamOptimizer",
+                      "What optimizer class to use.")
+  flags.DEFINE_float("clip_gradient_norm", 1.0, "Norm to clip gradients to.")
+  flags.DEFINE_bool(
+      "log_device_placement", False,
+      "Whether to write the device on which every op will run into the "
+      "logs on startup.")
+
+def validate_class_name(flag_value, category, modules, expected_superclass):
+  """Checks that the given string matches a class of the expected type.
+
+  Args:
+    flag_value: A string naming the class to instantiate.
+    category: A string used further describe the class in error messages
+              (e.g. 'model', 'reader', 'loss').
+    modules: A list of modules to search for the given class.
+    expected_superclass: A class that the given class should inherit from.
+
+  Raises:
+    FlagsError: If the given class could not be found or if the first class
+    found with that name doesn't inherit from the expected superclass.
+
+  Returns:
+    True if a class was found that matches the given constraints.
+  """
+  candidates = [getattr(module, flag_value, None) for module in modules]
+  for candidate in candidates:
+    if not candidate:
+      continue
+    if not issubclass(candidate, expected_superclass):
+      raise flags.FlagsError("%s '%s' doesn't inherit from %s." %
+                             (category, flag_value,
+                              expected_superclass.__name__))
+    return True
+  raise flags.FlagsError("Unable to find %s '%s'." % (category, flag_value))
+
+def get_input_data_tensors(reader,
+                           data_pattern,
+                           batch_size=1000,
+                           num_epochs=None,
+                           num_readers=1):
+  """Creates the section of the graph which reads the training data.
+
+  Args:
+    reader: A class which parses the training data.
+    data_pattern: A 'glob' style path to the data files.
+    batch_size: How many examples to process at a time.
+    num_epochs: How many passes to make over the training data. Set to 'None'
+                to run indefinitely.
+    num_readers: How many I/O threads to use.
+
+  Returns:
+    A tuple containing the features tensor, labels tensor, and optionally a
+    tensor containing the number of frames per video. The exact dimensions
+    depend on the reader being used.
+
+  Raises:
+    IOError: If no files matching the given pattern were found.
+  """
+  logging.info("Using batch size of " + str(batch_size) + " for training.")
+  with tf.name_scope("train_input"):
+    files = gfile.Glob(data_pattern)
+    if not files:
+      raise IOError("Unable to find training files. data_pattern='" +
+                    data_pattern + "'.")
+    logging.info("Number of training files: %s.", str(len(files)))
+    filename_queue = tf.train.string_input_producer(
+        files, num_epochs=num_epochs, shuffle=True)
+    training_data = [
+        reader.prepare_reader(filename_queue) for _ in range(num_readers)
+    ]
+
+    return tf.train.shuffle_batch_join(
+        training_data,
+        batch_size=batch_size,
+        capacity=batch_size * 5,
+        min_after_dequeue=batch_size,
+        allow_smaller_final_batch=True,
+        enqueue_many=True)
+
+
+def find_class_by_name(name, modules):
+  """Searches the provided modules for the named class and returns it."""
+  modules = [getattr(module, name, None) for module in modules]
+  return next(a for a in modules if a)
+
+def build_graph(reader,
+                model,
+                train_data_pattern,
+                label_loss_fn=losses.CrossEntropyLoss(),
+                batch_size=1000,
+                base_learning_rate=0.01,
+                learning_rate_decay_examples=1000000,
+                learning_rate_decay=0.95,
+                optimizer_class=tf.train.AdamOptimizer,
+                clip_gradient_norm=1.0,
+                regularization_penalty=1,
+                num_readers=1,
+                num_epochs=None):
+  """Creates the Tensorflow graph.
+
+  This will only be called once in the life of
+  a training model, because after the graph is created the model will be
+  restored from a meta graph file rather than being recreated.
+
+  Args:
+    reader: The data file reader. It should inherit from BaseReader.
+    model: The core model (e.g. logistic or neural net). It should inherit
+           from BaseModel.
+    train_data_pattern: glob path to the training data files.
+    label_loss_fn: What kind of loss to apply to the model. It should inherit
+                from BaseLoss.
+    batch_size: How many examples to process at a time.
+    base_learning_rate: What learning rate to initialize the optimizer with.
+    optimizer_class: Which optimization algorithm to use.
+    clip_gradient_norm: Magnitude of the gradient to clip to.
+    regularization_penalty: How much weight to give the regularization loss
+                            compared to the label loss.
+    num_readers: How many threads to use for I/O operations.
+    num_epochs: How many passes to make over the data. 'None' means an
+                unlimited number of passes.
+  """
+
+  global_step = tf.Variable(0, trainable=False, name="global_step")
+
+  local_device_protos = device_lib.list_local_devices()
+  gpus = [x.name for x in local_device_protos if x.device_type == 'GPU']
+  num_gpus = len(gpus)
+
+  if num_gpus > 0:
+    logging.info("Using the following GPUs to train: " + str(gpus))
+    num_towers = num_gpus
+    device_string = '/gpu:%d'
+  else:
+    logging.info("No GPUs found. Training on CPU.")
+    num_towers = 1
+    device_string = '/cpu:%d'
+
+  learning_rate = tf.train.exponential_decay(
+      base_learning_rate,
+      global_step * batch_size * num_towers,
+      learning_rate_decay_examples,
+      learning_rate_decay,
+      staircase=True)
+  tf.summary.scalar('learning_rate', learning_rate)
+
+  optimizer = optimizer_class(learning_rate)
+  unused_video_id, model_input_raw, labels_batch, num_frames = (
+      get_input_data_tensors(
+          reader,
+          train_data_pattern,
+          batch_size=batch_size * num_towers,
+          num_readers=num_readers,
+          num_epochs=num_epochs))
+  tf.summary.histogram("model/input_raw", model_input_raw)
+
+  feature_dim = len(model_input_raw.get_shape()) - 1
+
+  model_input = tf.nn.l2_normalize(model_input_raw, feature_dim)
+
+  tower_inputs = tf.split(model_input, num_towers)
+  tower_labels = tf.split(labels_batch, num_towers)
+  tower_num_frames = tf.split(num_frames, num_towers)
+  tower_gradients = []
+  tower_predictions = []
+  tower_label_losses = []
+  tower_reg_losses = []
+  for i in range(num_towers):
+    # For some reason these 'with' statements can't be combined onto the same
+    # line. They have to be nested.
+    with tf.device(device_string % i):
+      with (tf.variable_scope(("tower"), reuse=True if i > 0 else None)):
+        with (slim.arg_scope([slim.model_variable, slim.variable], device="/cpu:0" if num_gpus!=1 else "/gpu:0")):
+          result = model.create_model(
+            tower_inputs[i],
+            num_frames=tower_num_frames[i],
+            vocab_size=reader.num_classes,
+            labels=tower_labels[i])
+          for variable in slim.get_model_variables():
+            tf.summary.histogram(variable.op.name, variable)
+
+          predictions = result["predictions"]
+          tower_predictions.append(predictions)
+
+          if "loss" in result.keys():
+            label_loss = result["loss"]
+          else:
+            label_loss = label_loss_fn.calculate_loss(predictions, tower_labels[i])
+
+          if "regularization_loss" in result.keys():
+            reg_loss = result["regularization_loss"]
+          else:
+            reg_loss = tf.constant(0.0)
+
+          reg_losses = tf.losses.get_regularization_losses()
+          if reg_losses:
+            reg_loss += tf.add_n(reg_losses)
+
+          tower_reg_losses.append(reg_loss)
+
+          # Adds update_ops (e.g., moving average updates in batch normalization) as
+          # a dependency to the train_op.
+          update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
+          if "update_ops" in result.keys():
+            update_ops += result["update_ops"]
+          if update_ops:
+            with tf.control_dependencies(update_ops):
+              barrier = tf.no_op(name="gradient_barrier")
+              with tf.control_dependencies([barrier]):
+                label_loss = tf.identity(label_loss)
+
+          tower_label_losses.append(label_loss)
+
+          # Incorporate the L2 weight penalties etc.
+          final_loss = regularization_penalty * reg_loss + label_loss
+          gradients = optimizer.compute_gradients(final_loss,
+              colocate_gradients_with_ops=False)
+          tower_gradients.append(gradients)
+  label_loss = tf.reduce_mean(tf.stack(tower_label_losses))
+  tf.summary.scalar("label_loss", label_loss)
+  if regularization_penalty != 0:
+    reg_loss = tf.reduce_mean(tf.stack(tower_reg_losses))
+    tf.summary.scalar("reg_loss", reg_loss)
+  merged_gradients = utils.combine_gradients(tower_gradients)
+
+  if clip_gradient_norm > 0:
+    with tf.name_scope('clip_grads'):
+      merged_gradients = utils.clip_gradient_norms(merged_gradients, clip_gradient_norm)
+
+  train_op = optimizer.apply_gradients(merged_gradients, global_step=global_step)
+
+  tf.add_to_collection("global_step", global_step)
+  tf.add_to_collection("loss", label_loss)
+  tf.add_to_collection("predictions", tf.concat(tower_predictions, 0))
+  tf.add_to_collection("input_batch_raw", model_input_raw)
+  tf.add_to_collection("input_batch", model_input)
+  tf.add_to_collection("num_frames", num_frames)
+  tf.add_to_collection("labels", tf.cast(labels_batch, tf.float32))
+  tf.add_to_collection("train_op", train_op)
+
+
+class Trainer(object):
+  """A Trainer to train a Tensorflow graph."""
+
+  def __init__(self, cluster, task, train_dir, model, reader, model_exporter,
+               log_device_placement=True, max_steps=None,
+               export_model_steps=1000):
+    """"Creates a Trainer.
+
+    Args:
+      cluster: A tf.train.ClusterSpec if the execution is distributed.
+        None otherwise.
+      task: A TaskSpec describing the job type and the task index.
+    """
+
+    self.cluster = cluster
+    self.task = task
+    self.is_master = (task.type == "master" and task.index == 0)
+    self.train_dir = train_dir
+    self.config = tf.ConfigProto(
+        allow_soft_placement=True,log_device_placement=log_device_placement)
+    self.model = model
+    self.reader = reader
+    self.model_exporter = model_exporter
+    self.max_steps = max_steps
+    self.max_steps_reached = False
+    self.export_model_steps = export_model_steps
+    self.last_model_export_step = 0
+
+    if self.is_master and self.task.index > 0:
+      raise StandardError("%s: Only one replica of master expected",
+                          task_as_string(self.task))
+
+  def run(self, start_new_model=False):
+    """Performs training on the currently defined Tensorflow graph.
+
+    Returns:
+      A tuple of the training Hit@1 and the training PERR.
+    """
+    if self.is_master and start_new_model:
+      self.remove_training_directory(self.train_dir)
+
+    target, device_fn = self.start_server_if_distributed()
+
+    meta_filename = self.get_meta_filename(start_new_model, self.train_dir)
+
+    with tf.Graph().as_default() as graph:
+
+      if meta_filename:
+        saver = self.recover_model(meta_filename)
+
+      with tf.device(device_fn):
+        if not meta_filename:
+          saver = self.build_model(self.model, self.reader)
+
+        global_step = tf.get_collection("global_step")[0]
+        loss = tf.get_collection("loss")[0]
+        predictions = tf.get_collection("predictions")[0]
+        labels = tf.get_collection("labels")[0]
+        train_op = tf.get_collection("train_op")[0]
+        init_op = tf.global_variables_initializer()
+
+    sv = tf.train.Supervisor(
+        graph,
+        logdir=self.train_dir,
+        init_op=init_op,
+        is_chief=self.is_master,
+        global_step=global_step,
+        save_model_secs=15 * 60,
+        save_summaries_secs=120,
+        saver=saver)
+
+    logging.info("%s: Starting managed session.", task_as_string(self.task))
+    with sv.managed_session(target, config=self.config) as sess:
+      try:
+        logging.info("%s: Entering training loop.", task_as_string(self.task))
+        while (not sv.should_stop()) and (not self.max_steps_reached):
+          batch_start_time = time.time()
+          _, global_step_val, loss_val, predictions_val, labels_val = sess.run(
+              [train_op, global_step, loss, predictions, labels])
+          seconds_per_batch = time.time() - batch_start_time
+          examples_per_second = labels_val.shape[0] / seconds_per_batch
+
+          if self.max_steps and self.max_steps <= global_step_val:
+            self.max_steps_reached = True
+
+          if self.is_master and global_step_val % 10 == 0 and self.train_dir:
+            eval_start_time = time.time()
+            hit_at_one = eval_util.calculate_hit_at_one(predictions_val, labels_val)
+            perr = eval_util.calculate_precision_at_equal_recall_rate(predictions_val,
+                                                                      labels_val)
+            gap = eval_util.calculate_gap(predictions_val, labels_val)
+            eval_end_time = time.time()
+            eval_time = eval_end_time - eval_start_time
+
+            logging.info("training step " + str(global_step_val) + " | Loss: " + ("%.2f" % loss_val) +
+              " Examples/sec: " + ("%.2f" % examples_per_second) + " | Hit@1: " +
+              ("%.2f" % hit_at_one) + " PERR: " + ("%.2f" % perr) +
+              " GAP: " + ("%.2f" % gap))
+
+            sv.summary_writer.add_summary(
+                utils.MakeSummary("model/Training_Hit@1", hit_at_one),
+                global_step_val)
+            sv.summary_writer.add_summary(
+                utils.MakeSummary("model/Training_Perr", perr), global_step_val)
+            sv.summary_writer.add_summary(
+                utils.MakeSummary("model/Training_GAP", gap), global_step_val)
+            sv.summary_writer.add_summary(
+                utils.MakeSummary("global_step/Examples/Second",
+                                  examples_per_second), global_step_val)
+            sv.summary_writer.flush()
+
+            # Exporting the model every x steps
+            time_to_export = ((self.last_model_export_step == 0) or
+                (global_step_val - self.last_model_export_step
+                 >= self.export_model_steps))
+
+            if self.is_master and time_to_export:
+              self.export_model(global_step_val, sv.saver, sv.save_path, sess)
+              self.last_model_export_step = global_step_val
+          else:
+            logging.info("training step " + str(global_step_val) + " | Loss: " +
+              ("%.2f" % loss_val) + " Examples/sec: " + ("%.2f" % examples_per_second))
+      except tf.errors.OutOfRangeError:
+        logging.info("%s: Done training -- epoch limit reached.",
+                     task_as_string(self.task))
+
+    logging.info("%s: Exited training loop.", task_as_string(self.task))
+    sv.Stop()
+
+  def export_model(self, global_step_val, saver, save_path, session):
+
+    # If the model has already been exported at this step, return.
+    if global_step_val == self.last_model_export_step:
+      return
+
+    last_checkpoint = saver.save(session, save_path, global_step_val)
+
+    model_dir = "{0}/export/step_{1}".format(self.train_dir, global_step_val)
+    logging.info("%s: Exporting the model at step %s to %s.",
+                 task_as_string(self.task), global_step_val, model_dir)
+
+    self.model_exporter.export_model(
+        model_dir=model_dir,
+        global_step_val=global_step_val,
+        last_checkpoint=last_checkpoint)
+
+  def start_server_if_distributed(self):
+    """Starts a server if the execution is distributed."""
+
+    if self.cluster:
+      logging.info("%s: Starting trainer within cluster %s.",
+                   task_as_string(self.task), self.cluster.as_dict())
+      server = start_server(self.cluster, self.task)
+      target = server.target
+      device_fn = tf.train.replica_device_setter(
+          ps_device="/job:ps",
+          worker_device="/job:%s/task:%d" % (self.task.type, self.task.index),
+          cluster=self.cluster)
+    else:
+      target = ""
+      device_fn = ""
+    return (target, device_fn)
+
+  def remove_training_directory(self, train_dir):
+    """Removes the training directory."""
+    try:
+      logging.info(
+          "%s: Removing existing train directory.",
+          task_as_string(self.task))
+      gfile.DeleteRecursively(train_dir)
+    except:
+      logging.error(
+          "%s: Failed to delete directory " + train_dir +
+          " when starting a new model. Please delete it manually and" +
+          " try again.", task_as_string(self.task))
+
+  def get_meta_filename(self, start_new_model, train_dir):
+    if start_new_model:
+      logging.info("%s: Flag 'start_new_model' is set. Building a new model.",
+                   task_as_string(self.task))
+      return None
+
+    latest_checkpoint = tf.train.latest_checkpoint(train_dir)
+    if not latest_checkpoint:
+      logging.info("%s: No checkpoint file found. Building a new model.",
+                   task_as_string(self.task))
+      return None
+
+    meta_filename = latest_checkpoint + ".meta"
+    if not gfile.Exists(meta_filename):
+      logging.info("%s: No meta graph file found. Building a new model.",
+                     task_as_string(self.task))
+      return None
+    else:
+      return meta_filename
+
+  def recover_model(self, meta_filename):
+    logging.info("%s: Restoring from meta graph file %s",
+                 task_as_string(self.task), meta_filename)
+    return tf.train.import_meta_graph(meta_filename)
+
+  def build_model(self, model, reader):
+    """Find the model and build the graph."""
+
+    label_loss_fn = find_class_by_name(FLAGS.label_loss, [losses])()
+    optimizer_class = find_class_by_name(FLAGS.optimizer, [tf.train])
+
+    build_graph(reader=reader,
+                 model=model,
+                 optimizer_class=optimizer_class,
+                 clip_gradient_norm=FLAGS.clip_gradient_norm,
+                 train_data_pattern=FLAGS.train_data_pattern,
+                 label_loss_fn=label_loss_fn,
+                 base_learning_rate=FLAGS.base_learning_rate,
+                 learning_rate_decay=FLAGS.learning_rate_decay,
+                 learning_rate_decay_examples=FLAGS.learning_rate_decay_examples,
+                 regularization_penalty=FLAGS.regularization_penalty,
+                 num_readers=FLAGS.num_readers,
+                 batch_size=FLAGS.batch_size,
+                 num_epochs=FLAGS.num_epochs)
+
+    return tf.train.Saver(max_to_keep=0, keep_checkpoint_every_n_hours=0.25)
+
+
+def get_reader():
+  # Convert feature_names and feature_sizes to lists of values.
+  feature_names, feature_sizes = utils.GetListOfFeatureNamesAndSizes(
+      FLAGS.feature_names, FLAGS.feature_sizes)
+
+  if FLAGS.frame_features:
+    reader = readers.YT8MFrameFeatureReader(
+        feature_names=feature_names, feature_sizes=feature_sizes)
+  else:
+    reader = readers.YT8MAggregatedFeatureReader(
+        feature_names=feature_names, feature_sizes=feature_sizes)
+
+  return reader
+
+
+class ParameterServer(object):
+  """A parameter server to serve variables in a distributed execution."""
+
+  def __init__(self, cluster, task):
+    """Creates a ParameterServer.
+
+    Args:
+      cluster: A tf.train.ClusterSpec if the execution is distributed.
+        None otherwise.
+      task: A TaskSpec describing the job type and the task index.
+    """
+
+    self.cluster = cluster
+    self.task = task
+
+  def run(self):
+    """Starts the parameter server."""
+
+    logging.info("%s: Starting parameter server within cluster %s.",
+                 task_as_string(self.task), self.cluster.as_dict())
+    server = start_server(self.cluster, self.task)
+    server.join()
+
+
+def start_server(cluster, task):
+  """Creates a Server.
+
+  Args:
+    cluster: A tf.train.ClusterSpec if the execution is distributed.
+      None otherwise.
+    task: A TaskSpec describing the job type and the task index.
+  """
+
+  if not task.type:
+    raise ValueError("%s: The task type must be specified." %
+                     task_as_string(task))
+  if task.index is None:
+    raise ValueError("%s: The task index must be specified." %
+                     task_as_string(task))
+
+  # Create and start a server.
+  return tf.train.Server(
+      tf.train.ClusterSpec(cluster),
+      protocol="grpc",
+      job_name=task.type,
+      task_index=task.index)
+
+def task_as_string(task):
+  return "/job:%s/task:%s" % (task.type, task.index)
+
+def main(unused_argv):
+  # Load the environment.
+  env = json.loads(os.environ.get("TF_CONFIG", "{}"))
+
+  # Load the cluster data from the environment.
+  cluster_data = env.get("cluster", None)
+  cluster = tf.train.ClusterSpec(cluster_data) if cluster_data else None
+
+  # Load the task data from the environment.
+  task_data = env.get("task", None) or {"type": "master", "index": 0}
+  task = type("TaskSpec", (object,), task_data)
+
+  # Logging the version.
+  logging.set_verbosity(tf.logging.INFO)
+  logging.info("%s: Tensorflow version: %s.",
+               task_as_string(task), tf.__version__)
+
+  # Dispatch to a master, a worker, or a parameter server.
+  if not cluster or task.type == "master" or task.type == "worker":
+    model = find_class_by_name(FLAGS.model,
+        [frame_level_models, video_level_models])()
+
+    reader = get_reader()
+
+    model_exporter = export_model.ModelExporter(
+        frame_features=FLAGS.frame_features,
+        model=model,
+        reader=reader)
+
+    Trainer(cluster, task, FLAGS.train_dir, model, reader, model_exporter,
+            FLAGS.log_device_placement, FLAGS.max_steps,
+            FLAGS.export_model_steps).run(start_new_model=FLAGS.start_new_model)
+
+  elif task.type == "ps":
+    ParameterServer(cluster, task).run()
+  else:
+    raise ValueError("%s: Invalid task_type: %s." %
+                     (task_as_string(task), task.type))
+
+if __name__ == "__main__":
+  app.run()
+
+
+
+
+  //utils.py
+# Copyright 2016 Google Inc. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS-IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Contains a collection of util functions for training and evaluating.
+"""
+
+import numpy
+import tensorflow as tf
+from tensorflow import logging
+
+
+def Dequantize(feat_vector, max_quantized_value=2, min_quantized_value=-2):
+  """Dequantize the feature from the byte format to the float format.
+
+  Args:
+    feat_vector: the input 1-d vector.
+    max_quantized_value: the maximum of the quantized value.
+    min_quantized_value: the minimum of the quantized value.
+
+  Returns:
+    A float vector which has the same shape as feat_vector.
+  """
+  assert max_quantized_value > min_quantized_value
+  quantized_range = max_quantized_value - min_quantized_value
+  scalar = quantized_range / 255.0
+  bias = (quantized_range / 512.0) + min_quantized_value
+  return feat_vector * scalar + bias
+
+
+def MakeSummary(name, value):
+  """Creates a tf.Summary proto with the given name and value."""
+  summary = tf.Summary()
+  val = summary.value.add()
+  val.tag = str(name)
+  val.simple_value = float(value)
+  return summary
+
+
+def AddGlobalStepSummary(summary_writer,
+                         global_step_val,
+                         global_step_info_dict,
+                         summary_scope="Eval"):
+  """Add the global_step summary to the Tensorboard.
+
+  Args:
+    summary_writer: Tensorflow summary_writer.
+    global_step_val: a int value of the global step.
+    global_step_info_dict: a dictionary of the evaluation metrics calculated for
+      a mini-batch.
+    summary_scope: Train or Eval.
+
+  Returns:
+    A string of this global_step summary
+  """
+  this_hit_at_one = global_step_info_dict["hit_at_one"]
+  this_perr = global_step_info_dict["perr"]
+  this_loss = global_step_info_dict["loss"]
+  examples_per_second = global_step_info_dict.get("examples_per_second", -1)
+
+  summary_writer.add_summary(
+      MakeSummary("GlobalStep/" + summary_scope + "_Hit@1", this_hit_at_one),
+      global_step_val)
+  summary_writer.add_summary(
+      MakeSummary("GlobalStep/" + summary_scope + "_Perr", this_perr),
+      global_step_val)
+  summary_writer.add_summary(
+      MakeSummary("GlobalStep/" + summary_scope + "_Loss", this_loss),
+      global_step_val)
+
+  if examples_per_second != -1:
+    summary_writer.add_summary(
+        MakeSummary("GlobalStep/" + summary_scope + "_Example_Second",
+                    examples_per_second), global_step_val)
+
+  summary_writer.flush()
+  info = ("global_step {0} | Batch Hit@1: {1:.3f} | Batch PERR: {2:.3f} | Batch Loss: {3:.3f} "
+          "| Examples_per_sec: {4:.3f}").format(
+              global_step_val, this_hit_at_one, this_perr, this_loss,
+              examples_per_second)
+  return info
+
+
+def AddEpochSummary(summary_writer,
+                    global_step_val,
+                    epoch_info_dict,
+                    summary_scope="Eval"):
+  """Add the epoch summary to the Tensorboard.
+
+  Args:
+    summary_writer: Tensorflow summary_writer.
+    global_step_val: a int value of the global step.
+    epoch_info_dict: a dictionary of the evaluation metrics calculated for the
+      whole epoch.
+    summary_scope: Train or Eval.
+
+  Returns:
+    A string of this global_step summary
+  """
+  epoch_id = epoch_info_dict["epoch_id"]
+  avg_hit_at_one = epoch_info_dict["avg_hit_at_one"]
+  avg_perr = epoch_info_dict["avg_perr"]
+  avg_loss = epoch_info_dict["avg_loss"]
+  aps = epoch_info_dict["aps"]
+  gap = epoch_info_dict["gap"]
+  mean_ap = numpy.mean(aps)
+
+  summary_writer.add_summary(
+      MakeSummary("Epoch/" + summary_scope + "_Avg_Hit@1", avg_hit_at_one),
+      global_step_val)
+  summary_writer.add_summary(
+      MakeSummary("Epoch/" + summary_scope + "_Avg_Perr", avg_perr),
+      global_step_val)
+  summary_writer.add_summary(
+      MakeSummary("Epoch/" + summary_scope + "_Avg_Loss", avg_loss),
+      global_step_val)
+  summary_writer.add_summary(
+      MakeSummary("Epoch/" + summary_scope + "_MAP", mean_ap),
+          global_step_val)
+  summary_writer.add_summary(
+      MakeSummary("Epoch/" + summary_scope + "_GAP", gap),
+          global_step_val)
+  summary_writer.flush()
+
+  info = ("epoch/eval number {0} | Avg_Hit@1: {1:.3f} | Avg_PERR: {2:.3f} "
+          "| MAP: {3:.3f} | GAP: {4:.3f} | Avg_Loss: {5:3f}").format(
+          epoch_id, avg_hit_at_one, avg_perr, mean_ap, gap, avg_loss)
+  return info
+
+def GetListOfFeatureNamesAndSizes(feature_names, feature_sizes):
+  """Extract the list of feature names and the dimensionality of each feature
+     from string of comma separated values.
+
+  Args:
+    feature_names: string containing comma separated list of feature names
+    feature_sizes: string containing comma separated list of feature sizes
+
+  Returns:
+    List of the feature names and list of the dimensionality of each feature.
+    Elements in the first/second list are strings/integers.
+  """
+  list_of_feature_names = [
+      feature_names.strip() for feature_names in feature_names.split(',')]
+  list_of_feature_sizes = [
+      int(feature_sizes) for feature_sizes in feature_sizes.split(',')]
+  if len(list_of_feature_names) != len(list_of_feature_sizes):
+    logging.error("length of the feature names (=" +
+                  str(len(list_of_feature_names)) + ") != length of feature "
+                  "sizes (=" + str(len(list_of_feature_sizes)) + ")")
+
+  return list_of_feature_names, list_of_feature_sizes
+
+def clip_gradient_norms(gradients_to_variables, max_norm):
+  """Clips the gradients by the given value.
+
+  Args:
+    gradients_to_variables: A list of gradient to variable pairs (tuples).
+    max_norm: the maximum norm value.
+
+  Returns:
+    A list of clipped gradient to variable pairs.
+  """
+  clipped_grads_and_vars = []
+  for grad, var in gradients_to_variables:
+    if grad is not None:
+      if isinstance(grad, tf.IndexedSlices):
+        tmp = tf.clip_by_norm(grad.values, max_norm)
+        grad = tf.IndexedSlices(tmp, grad.indices, grad.dense_shape)
+      else:
+        grad = tf.clip_by_norm(grad, max_norm)
+    clipped_grads_and_vars.append((grad, var))
+  return clipped_grads_and_vars
+
+def combine_gradients(tower_grads):
+  """Calculate the combined gradient for each shared variable across all towers.
+
+  Note that this function provides a synchronization point across all towers.
+
+  Args:
+    tower_grads: List of lists of (gradient, variable) tuples. The outer list
+      is over individual gradients. The inner list is over the gradient
+      calculation for each tower.
+  Returns:
+     List of pairs of (gradient, variable) where the gradient has been summed
+     across all towers.
+  """
+  filtered_grads = [[x for x in grad_list if x[0] is not None] for grad_list in tower_grads]
+  final_grads = []
+  for i in xrange(len(filtered_grads[0])):
+    grads = [filtered_grads[t][i] for t in xrange(len(filtered_grads))]
+    grad = tf.stack([x[0] for x in grads], 0)
+    grad = tf.reduce_sum(grad, 0)
+    final_grads.append((grad, filtered_grads[0][i][1],))
+
+  return final_grads
+
+
+
+
+  //video_level_models.py
+# Copyright 2016 Google Inc. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS-IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Contains model definitions."""
+import math
+
+import models
+import tensorflow as tf
+import utils
+
+from tensorflow import flags
+import tensorflow.contrib.slim as slim
+
+FLAGS = flags.FLAGS
+flags.DEFINE_integer(
+    "moe_num_mixtures", 2,
+    "The number of mixtures (excluding the dummy 'expert') used for MoeModel.")
+
+class LogisticModel(models.BaseModel):
+  """Logistic model with L2 regularization."""
+
+  def create_model(self, model_input, vocab_size, l2_penalty=1e-8, **unused_params):
+    """Creates a logistic model.
+
+    Args:
+      model_input: 'batch' x 'num_features' matrix of input features.
+      vocab_size: The number of classes in the dataset.
+
+    Returns:
+      A dictionary with a tensor containing the probability predictions of the
+      model in the 'predictions' key. The dimensions of the tensor are
+      batch_size x num_classes."""
+    output = slim.fully_connected(
+        model_input, vocab_size, activation_fn=tf.nn.sigmoid,
+        weights_regularizer=slim.l2_regularizer(l2_penalty))
+    return {"predictions": output}
+
+class MoeModel(models.BaseModel):
+  """A softmax over a mixture of logistic models (with L2 regularization)."""
+
+  def create_model(self,
+                   model_input,
+                   vocab_size,
+                   num_mixtures=None,
+                   l2_penalty=1e-8,
+                   **unused_params):
+    """Creates a Mixture of (Logistic) Experts model.
+
+     The model consists of a per-class softmax distribution over a
+     configurable number of logistic classifiers. One of the classifiers in the
+     mixture is not trained, and always predicts 0.
+
+    Args:
+      model_input: 'batch_size' x 'num_features' matrix of input features.
+      vocab_size: The number of classes in the dataset.
+      num_mixtures: The number of mixtures (excluding a dummy 'expert' that
+        always predicts the non-existence of an entity).
+      l2_penalty: How much to penalize the squared magnitudes of parameter
+        values.
+    Returns:
+      A dictionary with a tensor containing the probability predictions of the
+      model in the 'predictions' key. The dimensions of the tensor are
+      batch_size x num_classes.
+    """
+    num_mixtures = num_mixtures or FLAGS.moe_num_mixtures
+
+    gate_activations = slim.fully_connected(
+        model_input,
+        vocab_size * (num_mixtures + 1),
+        activation_fn=None,
+        biases_initializer=None,
+        weights_regularizer=slim.l2_regularizer(l2_penalty),
+        scope="gates")
+    expert_activations = slim.fully_connected(
+        model_input,
+        vocab_size * num_mixtures,
+        activation_fn=None,
+        weights_regularizer=slim.l2_regularizer(l2_penalty),
+        scope="experts")
+
+    gating_distribution = tf.nn.softmax(tf.reshape(
+        gate_activations,
+        [-1, num_mixtures + 1]))  # (Batch * #Labels) x (num_mixtures + 1)
+    expert_distribution = tf.nn.sigmoid(tf.reshape(
+        expert_activations,
+        [-1, num_mixtures]))  # (Batch * #Labels) x num_mixtures
+
+    final_probabilities_by_class_and_batch = tf.reduce_sum(
+        gating_distribution[:, :num_mixtures] * expert_distribution, 1)
+    final_probabilities = tf.reshape(final_probabilities_by_class_and_batch,
+                                     [-1, vocab_size])
+    return {"predictions": final_probabilities}
